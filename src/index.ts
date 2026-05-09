@@ -17,6 +17,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { ensureMetricsServer } from './webhook-server.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -163,6 +164,10 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 7. Ensure /metrics is reachable even when no webhook adapter is loaded
+  //    (e.g. Feishu long-connection mode, CLI-only setups).
+  ensureMetricsServer();
 
   log.info(`${PLATFORM_NAME} running`);
 }

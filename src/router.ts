@@ -28,6 +28,7 @@ import {
 } from './db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent, findSessionForAgentOwner, getSession } from './db/sessions.js';
 import { maybeAutowireEnterpriseFrontdesk } from './enterprise-autowire.js';
+import { inboundTotal, startTimer } from './metrics.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { maybeStartProgressStatus, markProgressStatusFailed } from './modules/progress-status/index.js';
 import { log } from './log.js';
@@ -164,6 +165,19 @@ function isUserScopedSessionMode(
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
+  const endTimer = startTimer('route');
+  try {
+    await routeInboundInner(event);
+    inboundTotal.labels(event.channelType, 'accepted').inc();
+  } catch (err) {
+    inboundTotal.labels(event.channelType, 'rejected').inc();
+    throw err;
+  } finally {
+    endTimer();
+  }
+}
+
+async function routeInboundInner(event: InboundEvent): Promise<void> {
   // Pre-route interceptor — lets modules consume messages before any routing
   // (e.g. free-text replies during multi-step approval flows).
   if (messageInterceptor && (await messageInterceptor(event))) return;
