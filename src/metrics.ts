@@ -4,18 +4,18 @@
  * Scoped to the four signals most useful for diagnosing enterprise-scale
  * concurrency problems:
  *
- *   - nanoclaw_inbound_total{channel,outcome}
+ *   - frontlane_inbound_total{channel,outcome}
  *       webhook/long-connection ingress counter. `outcome` is one of
  *       `accepted` | `deduped` | `rejected`.
  *
- *   - nanoclaw_session_count{agent_group}
+ *   - frontlane_session_count{agent_group}
  *       gauge of active sessions per agent group. Sampled by the host sweep.
  *
- *   - nanoclaw_route_seconds{phase}
+ *   - frontlane_route_seconds{phase}
  *       histogram of router-side phase latencies. `phase` is `route` (full
  *       routeInbound duration) or `wake` (wakeContainer duration).
  *
- *   - nanoclaw_provider_errors_total{provider,code}
+ *   - frontlane_provider_errors_total{provider,code}
  *       container-provider error counter. Emitted via the delivery path when
  *       the container reports an error; left at zero when nothing registers.
  *
@@ -32,21 +32,21 @@ const registry = new client.Registry();
 client.collectDefaultMetrics({ register: registry });
 
 export const inboundTotal = new client.Counter({
-  name: 'nanoclaw_inbound_total',
+  name: 'frontlane_inbound_total',
   help: 'Inbound message events by channel + outcome',
   labelNames: ['channel', 'outcome'] as const,
   registers: [registry],
 });
 
 export const sessionCount = new client.Gauge({
-  name: 'nanoclaw_session_count',
+  name: 'frontlane_session_count',
   help: 'Active session count per agent group',
   labelNames: ['agent_group'] as const,
   registers: [registry],
 });
 
 export const routeSeconds = new client.Histogram({
-  name: 'nanoclaw_route_seconds',
+  name: 'frontlane_route_seconds',
   help: 'Router-side latency by phase',
   labelNames: ['phase'] as const,
   // Cover webhook-response budgets (<1s) through stuck-container timeouts.
@@ -55,7 +55,7 @@ export const routeSeconds = new client.Histogram({
 });
 
 export const providerErrorsTotal = new client.Counter({
-  name: 'nanoclaw_provider_errors_total',
+  name: 'frontlane_provider_errors_total',
   help: 'Container-provider errors by provider + code',
   labelNames: ['provider', 'code'] as const,
   registers: [registry],
