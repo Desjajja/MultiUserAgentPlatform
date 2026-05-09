@@ -69,6 +69,7 @@ Each request includes:
     "platformId": "oc_xxx",
     "threadId": null
   },
+  "requesterSource": "session",
   "operation": "sales.order.create",
   "input": {},
   "context": {},
@@ -77,7 +78,104 @@ Each request includes:
 }
 ```
 
-`/describe` only needs `agent` and `requester`.
+`/describe` only needs `agent`, `requester`, and `requesterSource`.
+
+### `requesterSource` is how the gateway decides how much to trust the `requester` block
+
+| value | meaning | recommended gateway policy |
+|-------|---------|----------------------------|
+| `session` | Identity was derived from the session's inbound messages — host-written, container cannot forge. Authoritative. | Normal permission flow. Attribute the action to `requester.userId`. |
+| `agent-asserted` | No trusted identity was available at batch start (scheduled task, a2a hop with no attribution source, orphan session). The `requester` block reflects whatever the agent passed as tool arguments. | Be strict. Default to rejecting writes. Allow only read / aggregate / non-destructive operations, and clearly log the ambiguity. |
+
+The agent cannot set this field — it's set by the container runtime based on
+what it could resolve at the start of the batch. See
+`container/agent-runner/src/request-identity.ts` for the resolution rules.
+
+## Identity propagation across agent-to-agent hops
+
+When frontdesk delegates to a worker (`messages_out.channel_type = 'agent'`),
+the host copies the originating employee's namespaced user id onto the
+target session's inbound row as `origin_user_id`. The worker's batch
+identity resolver prefers that column, so an ERP call from a deeply-nested
+worker still attributes to the real human, not to a generic
+`agent-asserted` fallback.
+
+This means: you don't need to reconstruct the identity chain on the
+gateway side. One `requester.userId` per call is enough — it's the same
+user id whether frontdesk or a 3-hop worker made the call.
+
+## HMAC request signing
+
+If `container.json`'s `enterpriseGateway.signingKey` is set, every gateway
+request carries three headers:
+
+- `x-frontlane-timestamp` — unix seconds
+- `x-frontlane-nonce` — 32-char hex
+- `x-frontlane-signature` — HMAC-SHA256 over `<timestamp>.<nonce>.<body>`
+
+Gateway-side verification (reference implementation):
+
+```ts
+import crypto from 'node:crypto';
+
+const expected = crypto
+  .createHmac('sha256', process.env.FRONTLANE_SIGNING_KEY!)
+  .update(`${ts}.${nonce}.${rawBody}`)
+  .digest('hex');
+const valid = crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+```
+
+Recommended companion policies on the gateway:
+
+- reject timestamps more than ±5 minutes out of sync
+- reject nonces that have been seen in the last 10 minutes (in-process LRU
+  or Redis TTL is fine)
+- reject any request missing the three headers when a signing key is
+  configured
+
+Header names can be overridden per group via
+`enterpriseGateway.signingHeaders.{timestamp,nonce,signature}` if the
+gateway you're fronting has mandatory naming conventions.
+
+Signing is opt-in — leaving `signingKey` unset skips the headers entirely
+(so existing deployments don't break on upgrade). Turn it on once your
+gateway is ready to verify.
+
+## Host-side audit trail (erp_audit)
+
+Independently of what the gateway itself logs, FrontLane writes a
+per-call audit row into the central DB's `erp_audit` table. The container
+emits a `kind='system', action='erp_audit'` message after every gateway
+call (win or lose); the host's `src/modules/erp-audit/index.ts` handler
+persists it.
+
+Recorded fields:
+
+- `occurred_at`, `session_id`, `agent_group_id`, `user_id`
+- `path` — `/describe` / `/authorize` / `/execute` / `/memory/get` / `/memory/upsert`
+- `operation` — for authorize/execute calls
+- `requester_source` — same `'session'` / `'agent-asserted'` value the
+  gateway saw
+- `status` — `ok` / `error`
+- `http_status`, `duration_ms`, `idempotency_key`
+- `input_hash` — SHA256 of the business payload, scoped by path so
+  `/memory/*` and `/execute` calls don't collapse to the same digest
+- `error_msg` on failure
+
+Typical queries:
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "SELECT occurred_at, user_id, path, operation, status, http_status
+     FROM erp_audit
+     WHERE occurred_at > datetime('now', '-1 hour')
+     ORDER BY id DESC LIMIT 50"
+```
+
+The audit write is best-effort (container → host → DB); if the DB write
+itself fails, the row is dropped. For environments where the gateway side
+needs to reconcile the full trail even when that happens, run audit on
+the gateway as well and match by `idempotencyKey` / returned audit id.
 
 ## Response guidance
 

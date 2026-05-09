@@ -2,41 +2,102 @@
 
 ## Core Idea
 
-Each agent session has a mounted SQLite DB. The DB is the one and only IO mechanism between host and container. No IPC files, no stdin piping. Two tables: messages_in (host → agent-runner) and messages_out (agent-runner → host). Everything is a message.
+Each agent session has a **pair** of mounted SQLite files. Together they are
+the sole IO channel between host and container. No IPC files, no stdin
+piping. Everything is a message.
+
+- `inbound.db` — host writes, container reads. Holds `messages_in`,
+  routing metadata, destinations, pending questions, processing_ack.
+- `outbound.db` — container writes, host reads. Holds `messages_out`,
+  session_state, container_state.
+
+Splitting the writers this way eliminates cross-mount lock contention:
+each file has exactly one writer. See `src/session-manager.ts` for the
+cross-mount invariants (DELETE journal, open-write-close, etc.) that make
+this work on virtiofs / Apple Container filesystems.
+
+Heartbeat is a file touch at `/workspace/.heartbeat`, not a DB update, so
+the host can detect "alive but silent" containers without either side
+writing to the other side's DB.
 
 ## Two-Level DB
 
-**Central DB (host process):**
-- Agent groups, conversations, routing tables
-- Maps platform IDs → agent groups → sessions
+**Central DB (host process, `data/v2.db`):**
+- Agent groups, messaging groups, wirings, sessions
+- Users, user_roles, agent_group_members
+- Enterprise audit trail (`erp_audit`, `enterprise_audit`)
+- Inbound message dedup, progress reactions, schema_version
 - Channel adapters don't touch this directly — the host does the lookup
 
-**Per-session DB (mounted into container):**
-- messages_in (written by host, read by agent-runner)
-- messages_out (written by agent-runner, read by host)
-- Everything is a message: chat, tasks, webhooks, system actions, agent-to-agent — all use these two tables
-- One DB per session, not per agent group
+**Per-session DBs (mounted into container at `/workspace/inbound.db` +
+`/workspace/outbound.db`):**
+- messages_in / messages_out — chat, tasks, webhooks, system actions,
+  agent-to-agent traffic, everything
+- No cross-file writes: host only writes inbound.db, container only
+  writes outbound.db
 
 ## Agent Groups vs Sessions
 
-An agent group has its own filesystem — folder, CLAUDE.md, skills, container config. Multiple sessions can share the same agent group (same filesystem, same skills) but each session gets its own DB mounted at a known path. Each session = a separate container with the same agent group's filesystem but a different session DB.
+An agent group has its own filesystem — folder, CLAUDE.md, skills, container
+config. Multiple sessions can share the same agent group (same filesystem,
+same skills) but each session gets its own inbound.db + outbound.db
+mounted at known paths. Each session = a separate container with the same
+agent group's filesystem but different session DBs.
 
 ## Message Flow
 
 ```
 Platform event
   → Channel adapter (trigger check, ID extraction)
-  → Returns: { platformChannelId, platformThreadId, triggered }
-  → Host maps platformChannelId + platformThreadId → agent group + session
-  → Host writes message to session's DB
-  → Host calls wakeUpAgent(session)
+  → Returns: InboundEvent { channelType, platformId, threadId, message }
+  → Router maps channelType + platformId → messaging group → agent groups
+  → For each engaged agent: host resolves session, writes to inbound.db,
+    calls wakeContainer(session)
   → Container spins up (or is already running)
-  → Agent-runner polls its session DB, finds new messages
-  → Agent-runner processes with Claude
-  → Agent-runner writes response to session DB
-  → Host polls active session DBs for responses
-  → Host reads response, looks up conversation, delivers through channel adapter
+  → Agent-runner polls inbound.db, finds new messages, publishes a
+    batch RequestIdentity for trust-sensitive tools (see below)
+  → Agent-runner processes with the configured provider
+  → Agent-runner writes response to outbound.db
+  → Host delivery loop polls outbound.db for undelivered rows
+  → Host reads the response, delivers through the originating channel
+    adapter (or agent-to-agent, or system action handler)
 ```
+
+## Identity Model (RequestIdentity + origin_user_id)
+
+Trust-sensitive tool handlers — the ERP gateway MCP tools are the current
+headline — must not take the requester identity from the agent's own tool
+arguments. An agent that's been prompt-injected can otherwise call
+`erp_execute` as any user it names.
+
+Two concrete mechanisms enforce this:
+
+1. **Batch-pinned RequestIdentity (container side).** At the start of each
+   poll batch, `container/agent-runner/src/request-identity.ts` derives
+   a `RequestIdentity` from the first `trigger=1` chat row in the batch:
+   - Prefer `origin_user_id` on the row (host-written, container cannot
+     forge it).
+   - Else parse `senderId` out of the message content and namespace it
+     with the row's `channel_type`.
+   - If neither is available (scheduled task, a2a hop with no attribution
+     source), `source='agent-asserted'` — flag for the backend.
+
+   The identity is published via `request-context.ts` and cleared at
+   batch end. Tool handlers read it instead of querying the DB at call
+   time — that eliminates the race where a mid-turn inbound would flip
+   "most recent message" under the tool call.
+
+2. **origin_user_id traversal (host side).** `messages_in` has an
+   `origin_user_id` column. Channel-side inbound leaves it NULL (senderId
+   in the content payload is authoritative). The agent-to-agent module
+   (`src/modules/agent-to-agent/agent-route.ts`) copies it from the source
+   session when writing the target row, so worker sessions see the real
+   employee id even N hops down the delegation chain.
+
+Gateway requests carry both the resolved `requester` block and an explicit
+`requesterSource: 'session' | 'agent-asserted'` field so the backend can
+apply a stricter policy to unauthenticated requests (typically: reject
+writes when the source is agent-asserted).
 
 ## Channel Adapters
 
@@ -382,15 +443,17 @@ The receiving agent gets a normal chat message. It doesn't need to know the sour
 
 **Host validation:** Before delivering, the host checks that this agent group is permitted to send to the destination. The agent-runner copies routing; the host validates.
 
-**Multi-destination pattern (customization):** An agent may need to send to a different channel than the origin (e.g., a webhook triggers a Slack notification). This is supported via custom code, not built into the core:
+**Multi-destination pattern:** An agent may need to send to a different
+channel than the origin (e.g., a webhook triggers a Slack notification).
+The agent-to-agent module ships this out of the box:
 
-1. Add a `destinations` table to the session DB mapping logical names to routing fields
-2. Populate it from the host when setting up the session
-3. Modify the agent's prompt to list available destinations
-4. Agent chooses a destination by name; agent-runner resolves to routing fields
-5. Host validates as usual
-
-This is documented as a pattern, not a built-in feature.
+1. `destinations` table lives in each session's `inbound.db`
+2. `src/modules/agent-to-agent/write-destinations.ts` populates it on every
+   container wake from the central-DB `agent_destinations` table
+3. Agents pick a destination by logical name; agent-runner resolves to
+   routing fields on the outbound message
+4. Host validates against `agent_destinations` before delivery
+   (`src/delivery.ts`)
 
 ## Core Properties
 - Container isolation via filesystem mounts
@@ -398,7 +461,8 @@ This is documented as a pattern, not a built-in feature.
 - Per-agent-group workspace (folder, CLAUDE.md, skills)
 - Polling-based (not event-driven)
 - Per-agent-group agent-runner recompilation on container startup (agent can modify its own source, request rebuild/restart, changes persist across teardowns)
-- Host ↔ container IO through mounted session DBs (`messages_in` / `messages_out`) — no stdin piping, no IPC files
+- Host ↔ container IO through the per-session DB pair (`inbound.db` +
+  `outbound.db`) — single writer per file, no stdin piping, no IPC files
 - Agent commands are `messages_out` rows with `kind: 'system'`
 - Agent-to-agent supported via target-agent routing on `messages_out`
 - Scheduling uses `process_after` / `deliver_after` + `recurrence` on the same message tables
@@ -410,14 +474,21 @@ This is documented as a pattern, not a built-in feature.
 
 ## Design Decisions
 
-**Session DB location:** Not in the agent group folder. Separate directory (e.g., `sessions/{session_id}/`). Each session gets its own folder containing `session.db` and the Claude SDK's `.claude/` directory. The session identity IS the folder — no need to track Claude SDK session IDs.
+**Session DB location:** Not in the agent group folder. Separate directory
+under `data/v2-sessions/{agent_group_id}/{session_id}/`. Each session
+folder contains two SQLite files — `inbound.db` (host-writable) and
+`outbound.db` (container-writable) — plus the Claude SDK's `.claude/`
+directory. The session identity IS the folder — no need to track
+provider-specific session IDs.
 
 **Container mount structure:**
 
 ```
 /workspace/                 ← mount: session folder (read-write)
   .claude/                  ← Claude SDK session data (auto-created)
-  session.db                ← session SQLite DB
+  inbound.db                ← host writes, container reads
+  outbound.db               ← container writes, host reads
+  .heartbeat                ← file touched by container-runner each poll
   outbox/                   ← agent-runner writes outbound files here
   agent/                    ← mount: agent group folder (nested, read-write)
     CLAUDE.md               ← agent instructions
@@ -425,19 +496,37 @@ This is documented as a pattern, not a built-in feature.
     ... working files
 ```
 
-Two directory mounts: session folder at `/workspace`, agent group folder at `/workspace/agent/`. The agent-runner CDs into `/workspace/agent/` to run the agent. Claude SDK writes `.claude/` at `/workspace/.claude/` (root of the workspace). The session DB is at `/workspace/session.db`.
+Two directory mounts: session folder at `/workspace`, agent group folder
+at `/workspace/agent/`. The agent-runner CDs into `/workspace/agent/` to
+run the agent. Claude SDK writes `.claude/` at `/workspace/.claude/` (root
+of the workspace). The session DBs are at `/workspace/inbound.db` and
+`/workspace/outbound.db`.
 
-This works on both Docker (nested bind mounts) and Apple Container (directory mounts only — no file-level mounts, but nested directory mounts are supported).
+This works on both Docker (nested bind mounts) and Apple Container
+(directory mounts only — no file-level mounts, but nested directory
+mounts are supported).
 
-**Session DB concurrent access:** The host writes messages_in, the agent-runner writes messages_out. Both access the same SQLite file simultaneously. WAL mode handles this — SQLite allows concurrent readers, and the two sides write to different tables so writer contention is minimal. The host enables WAL mode when creating the session DB.
+**Session DB concurrent access:** The two files have exactly one writer
+each — inbound.db writer is the host, outbound.db writer is the container.
+This replaces the older "both sides write one file with WAL" design,
+which didn't survive virtiofs / Apple Container mounts reliably. Both DBs
+run in DELETE journal mode because cross-mount WAL coherency isn't
+guaranteed (the `-shm` mapping doesn't propagate). See
+`src/session-manager.ts` for the full set of cross-mount invariants and
+`scripts/sanity-live-poll.ts` for empirical validation of what works on
+which runtime.
 
 **Session management:** Host-managed. The host creates session folders and mounts them. The container only sees its own session folder.
 
 **Session creation (no race condition):**
 
-1. Message arrives, host checks central DB for a session matching this group + thread
-2. No session exists → host atomically creates session row in central DB, creates the session folder, creates the session DB, writes the message
-3. More messages arrive before container starts → host finds the existing session, writes to the same session DB
+1. Message arrives, host checks central DB for a session matching this
+   group + messaging group + (owner, thread) scope
+2. No session exists → host atomically creates session row in central DB,
+   creates the session folder, initializes inbound.db + outbound.db,
+   writes the message
+3. More messages arrive before container starts → host finds the existing
+   session, writes to the same inbound.db
 4. Container starts, mounts the folder, agent-runner finds messages waiting
 
 The central DB session row creation is the serialization point. No Claude SDK session ID to coordinate — the SDK discovers its own session data in `.claude/` when the agent runs.

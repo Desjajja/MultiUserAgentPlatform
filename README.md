@@ -13,20 +13,43 @@
 
 ## 当前已经落地的能力
 
+**消息接入 / 会话**
+
 - 内置 `feishu` 通道，支持 webhook / long-connection / hybrid
 - 内置 `cli` 通道，方便本地调试
 - 支持 shared、per-user、per-user-per-thread 等 session 隔离模式
 - 支持 frontdesk -> worker 的 agent-to-agent 派活
 - 支持 `root-session` worker 会话模式：同一个员工的请求会带着自己的根会话上下文进入 worker
 - 支持企业前台自动接线：员工第一次私聊飞书机器人时可自动接到 `frontlane-frontdesk`
-- 支持 ERP Gateway MCP 工具：
-  - `erp_describe`
-  - `erp_authorize`
-  - `erp_execute`
-  - `erp_memory_get`
-  - `erp_memory_upsert`
-- 支持 OpenAI compatible provider
 - 飞书通道支持用 reaction 做“处理中”状态提示，避免机器人先发一条废话消息
+
+**身份与审计（企业场景的信任链）**
+
+- Batch 级 `RequestIdentity`：tool 调用用的用户身份在 poll 批次开始时固定下来，而不是每次 tool call 重新查 DB，杜绝多人群聊里的归属漂移
+- `origin_user_id` 跨 a2a 链路传递：frontdesk 派给 worker 的任务仍然带着原始员工身份，ERP 调用能正确归属
+- ERP gateway HMAC 签名（可选）：`signingKey` 配置后每次请求带 `x-frontlane-timestamp/nonce/signature`，后端可拒绝未签名或重放请求
+- `erp_audit` 中央审计表：每次 ERP 调用（成功或失败）都落一行，字段包含 user_id / operation / requester_source / input_hash / http_status / duration
+- `requesterSource='session' | 'agent-asserted'` 显式标注，后端可对无可信身份的请求采用更严格策略（例如拒绝所有 write）
+
+**ERP Gateway MCP 工具**
+
+- `erp_describe`
+- `erp_authorize`
+- `erp_execute`
+- `erp_memory_get`
+- `erp_memory_upsert`
+
+**Provider 与容器**
+
+- 支持 OpenAI compatible provider
+- 容器侧 lazy idle-exit：`FRONTLANE_IDLE_EXIT_MS` 配置后，闲置容器主动退出释放内存，同用户连续对话仍复用热容器
+- Per-agent-group Docker 资源限制：`container.json` 里的 `resources.memoryMb / cpus / pidsLimit` 对应 docker run 的 `--memory / --cpus / --pids-limit`
+
+**运维与可观测**
+
+- Prometheus 指标 `/metrics`：入站、session 计数、路由时延、容器退出分类、session 生命周期、provider 错误
+- Session TTL + 归档：`FRONTLANE_SESSION_TTL_DAYS` 后自动 tar 到 `data/v2-sessions-archive/`，防止 session 表无限增长
+- 入站 webhook 去重（`inbound_dedup` 表）：飞书 at-least-once 投递不会造成重复处理
 
 ## 当前推荐架构
 
@@ -128,6 +151,23 @@ FEISHU_ENCRYPT_KEY=xxx
 FEISHU_VERIFICATION_TOKEN=xxx
 WEBHOOK_PORT=3000
 FEISHU_WEBHOOK_PATH=/webhook/feishu
+```
+
+生产部署推荐再加几个运维相关的开关（都是可选的，默认关闭以保持向后兼容）：
+
+```bash
+# 容器生命周期
+FRONTLANE_IDLE_EXIT_MS=120000                # 2 分钟空闲容器主动退出，释放内存
+FRONTLANE_SESSION_TTL_DAYS=30                # 30 天空闲 session 自动归档到 tar
+# FRONTLANE_ARCHIVE_HARD_DELETE_DAYS=90      # 归档再过 90 天物理删除（谨慎开启）
+
+# 飞书处理中状态提示
+FRONTLANE_PROGRESS_STATUS_CHANNELS=feishu    # 哪些通道启用 reaction 进度指示
+# FRONTLANE_PROGRESS_STATUS_FEISHU_EMOJI=THINKING  # 自定义 emoji
+
+# 企业入口 autowire 安全开关
+# ENTERPRISE_AUTO_WIRE_ALLOW_POLICY_DOWNGRADE=false  # 禁止 autowire 自动降级
+                                                     # unknown_sender_policy，默认 true
 ```
 
 ### 3. 初始化企业拓扑
@@ -233,14 +273,14 @@ FEISHU_EVENT_MODE=hybrid
 
 ## 当前状态
 
-这个仓库现在是“企业版 agent infra baseline”，不是一个完全产品化的平台。
+这个仓库现在是“企业版 agent infra baseline”，已经适合承接业务。
 
-已经适合继续往下接业务，但你应该明确下面几点：
+几点需要明确：
 
-- 鉴权和权限边界仍然要靠 ERP Gateway，不要指望聊天层 ACL
+- 鉴权和权限边界靠 ERP Gateway，聊天层没有也不打算有业务级 ACL
 - 群聊安全边界目前是轻量的，适合接待、分流、解释、预览，不适合直接做高风险写操作
-- 当前对外品牌已切到 `FrontLane`，少量底层实现仍沿用历史结构，但不影响新部署和使用
-- 文档已经切到企业场景，但代码层还没有做完整品牌重命名
+- 身份信任链已经完整：batch 级 `RequestIdentity` + a2a 跨 hop `origin_user_id` + HMAC 签名 + `erp_audit` 中央审计
+- 品牌 / 文档 / 指标名已经统一到 `FrontLane`；少数底层 runtime identifier（Docker 镜像名、容器 label）仍沿用 `nanoclaw-*`，不影响新部署
 
 ## 相关文档
 
