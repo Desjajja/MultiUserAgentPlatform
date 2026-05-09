@@ -123,7 +123,17 @@ export interface Session {
    */
   root_session_id?: string | null;
   agent_provider: string | null;
-  status: 'active' | 'closed';
+  /**
+   * Lifecycle state for the session:
+   *   - `active`    — normal in-use session (default on create).
+   *   - `closed`    — explicitly closed by admin / user command. No new
+   *                   inbound is routed in; retained for scroll-back.
+   *   - `archived`  — idled out past FRONTLANE_SESSION_TTL_DAYS and moved
+   *                   to on-disk archive. Filesystem under
+   *                   data/v2-sessions-archive/. DB row kept so audit
+   *                   queries still resolve the session id.
+   */
+  status: 'active' | 'closed' | 'archived';
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   created_at: string;

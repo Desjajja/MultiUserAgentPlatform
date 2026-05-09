@@ -8,8 +8,13 @@
  *       webhook/long-connection ingress counter. `outcome` is one of
  *       `accepted` | `deduped` | `rejected`.
  *
- *   - frontlane_session_count{agent_group}
- *       gauge of active sessions per agent group. Sampled by the host sweep.
+ *   - frontlane_session_count{agent_group,status}
+ *       gauge of sessions per agent group, grouped by lifecycle status
+ *       (active / archived / closed). Sampled by the host sweep.
+ *
+ *   - frontlane_session_lifecycle_total{action}
+ *       counter of session lifecycle transitions applied by the sweep.
+ *       `action` is `archived` or `hard_deleted`.
  *
  *   - frontlane_route_seconds{phase}
  *       histogram of router-side phase latencies. `phase` is `route` (full
@@ -40,8 +45,15 @@ export const inboundTotal = new client.Counter({
 
 export const sessionCount = new client.Gauge({
   name: 'frontlane_session_count',
-  help: 'Active session count per agent group',
-  labelNames: ['agent_group'] as const,
+  help: 'Session count per agent group and lifecycle status',
+  labelNames: ['agent_group', 'status'] as const,
+  registers: [registry],
+});
+
+export const sessionLifecycleTotal = new client.Counter({
+  name: 'frontlane_session_lifecycle_total',
+  help: 'Session lifecycle transitions applied by the sweep',
+  labelNames: ['action'] as const,
   registers: [registry],
 });
 

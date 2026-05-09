@@ -108,6 +108,48 @@ export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }
 
+/**
+ * Active sessions whose last_active is older than `beforeIso` and whose
+ * container isn't currently running. Running sessions are never archived —
+ * archival tears down the filesystem out from under the container.
+ *
+ * `limit` caps per-tick work so a huge backlog doesn't block the sweep.
+ */
+export function findArchivableSessions(beforeIso: string, limit: number): Session[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+         WHERE status = 'active'
+           AND container_status = 'stopped'
+           AND last_active IS NOT NULL
+           AND last_active < ?
+         ORDER BY last_active ASC
+         LIMIT ?`,
+    )
+    .all(beforeIso, limit) as Session[];
+}
+
+/** Archived sessions older than `beforeIso` — candidates for hard delete. */
+export function findArchivedSessionsOlderThan(beforeIso: string, limit: number): Session[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+         WHERE status = 'archived'
+           AND last_active IS NOT NULL
+           AND last_active < ?
+         ORDER BY last_active ASC
+         LIMIT ?`,
+    )
+    .all(beforeIso, limit) as Session[];
+}
+
+/** Counts grouped by status — used by the session-count metric gauge. */
+export function countSessionsByStatus(): Array<{ status: string; count: number }> {
+  return getDb()
+    .prepare('SELECT status, COUNT(*) AS count FROM sessions GROUP BY status')
+    .all() as Array<{ status: string; count: number }>;
+}
+
 export function getRunningSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
 }

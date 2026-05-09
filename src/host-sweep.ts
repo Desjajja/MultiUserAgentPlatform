@@ -44,9 +44,11 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { sessionCount } from './metrics.js';
+import { sessionCount, sessionLifecycleTotal } from './metrics.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { runSessionLifecycleSweep } from './session-archive.js';
+import { countSessionsByStatus } from './db/sessions.js';
 import type { Session } from './types.js';
 
 /**
@@ -152,6 +154,21 @@ async function sweep(): Promise<void> {
     log.warn('Inbound dedup prune failed', { err });
   }
 
+  try {
+    const result = await runSessionLifecycleSweep();
+    if (result.archived > 0) {
+      sessionLifecycleTotal.labels('archived').inc(result.archived);
+      log.info('Session lifecycle sweep archived sessions', { archived: result.archived });
+    }
+    if (result.hardDeleted > 0) {
+      sessionLifecycleTotal.labels('hard_deleted').inc(result.hardDeleted);
+      log.info('Session lifecycle sweep hard-deleted sessions', { hardDeleted: result.hardDeleted });
+    }
+    sampleAllStatusCounts();
+  } catch (err) {
+    log.error('Session lifecycle sweep failed', { err });
+  }
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
@@ -163,7 +180,26 @@ function sampleSessionCount(sessions: Session[]): void {
   // Reset gauge before repopulating so disappeared agent groups don't stick.
   sessionCount.reset();
   for (const [agentGroup, count] of byGroup) {
-    sessionCount.labels(agentGroup).set(count);
+    sessionCount.labels(agentGroup, 'active').set(count);
+  }
+}
+
+/**
+ * Secondary sampling pass that populates non-active rows (archived,
+ * closed). Called once per sweep tick after the lifecycle run so the gauge
+ * reflects the archived count that was just updated.
+ */
+function sampleAllStatusCounts(): void {
+  try {
+    for (const { status, count } of countSessionsByStatus()) {
+      if (status === 'active') continue; // handled by sampleSessionCount
+      // Non-active buckets aren't per-agent — we just want the total per
+      // status. Use a synthetic agent_group label so Prometheus doesn't
+      // drop the sample.
+      sessionCount.labels('__all__', status).set(count);
+    }
+  } catch (err) {
+    log.warn('sampleAllStatusCounts failed', { err });
   }
 }
 
