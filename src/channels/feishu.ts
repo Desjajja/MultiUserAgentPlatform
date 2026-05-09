@@ -5,6 +5,7 @@ import { PLATFORM_PROTOCOL_NAMESPACE } from '../branding.js';
 import { markInboundSeen } from '../db/inbound-dedup.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { inboundTotal } from '../metrics.js';
 import { registerWebhookHandler } from '../webhook-server.js';
 import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -954,7 +955,10 @@ function createAdapter(config: FeishuConfig): ChannelAdapter {
       });
       return;
     }
-    if (!markInboundSeen('feishu', `msg:${event.message.message_id}`)) return;
+    if (!markInboundSeen('feishu', `msg:${event.message.message_id}`)) {
+      inboundTotal.labels('feishu', 'deduped').inc();
+      return;
+    }
 
     const isGroup = event.message.chat_type === 'group';
     const text = parseTextContent(event.message.content, event.message.message_type);
@@ -1030,7 +1034,11 @@ function createAdapter(config: FeishuConfig): ChannelAdapter {
   async function handleCardAction(event: FeishuCardActionEvent): Promise<void> {
     if (!setupConfig) return;
     const token = event.token.trim();
-    if (!token || !markInboundSeen('feishu', `action:${token}`)) return;
+    if (!token) return;
+    if (!markInboundSeen('feishu', `action:${token}`)) {
+      inboundTotal.labels('feishu', 'deduped').inc();
+      return;
+    }
     const action = parseFeishuQuestionActionPayload(event.action.value);
     if (!action) {
       log.warn('Feishu card action ignored: unsupported payload', {

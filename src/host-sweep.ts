@@ -44,6 +44,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { sessionCount } from './metrics.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
@@ -136,6 +137,7 @@ async function sweep(): Promise<void> {
 
   try {
     const sessions = getActiveSessions();
+    sampleSessionCount(sessions);
     for (const session of sessions) {
       await sweepSession(session);
     }
@@ -151,6 +153,18 @@ async function sweep(): Promise<void> {
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+function sampleSessionCount(sessions: Session[]): void {
+  const byGroup = new Map<string, number>();
+  for (const session of sessions) {
+    byGroup.set(session.agent_group_id, (byGroup.get(session.agent_group_id) ?? 0) + 1);
+  }
+  // Reset gauge before repopulating so disappeared agent groups don't stick.
+  sessionCount.reset();
+  for (const [agentGroup, count] of byGroup) {
+    sessionCount.labels(agentGroup).set(count);
+  }
 }
 
 async function sweepSession(session: Session): Promise<void> {
