@@ -115,6 +115,22 @@ Defaults for shared entry wiring:
 - threaded group surface: `per-user-per-thread`
 - DM surface (`--dm`): `shared`
 
+### Default container resource caps
+
+`init-enterprise-topology` also seeds conservative Docker resource caps
+into each new group's `container.json`, so a runaway worker can't
+exhaust host memory or fork-bomb the kernel:
+
+| Role      | memoryMb | cpus | pidsLimit |
+|-----------|----------|------|-----------|
+| frontdesk | 768      | 1    | 384       |
+| worker    | 1024     | 1    | 512       |
+
+Only written when `resources` is absent — hand-tuned caps survive
+script reruns. Raise / lower them in `groups/<folder>/container.json`
+based on what the worker actually does (e.g. `agent-browser` workers
+typically need 2048 MB).
+
 The script is intentionally infra-only. It does not implement ERP auth, role resolution, or business permissions. Those still belong in your backend capability layer.
 
 ## Runtime auto-ingress for Feishu

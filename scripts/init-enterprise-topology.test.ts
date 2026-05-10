@@ -102,4 +102,31 @@ describe('init-enterprise-topology', () => {
     expect(readContainerConfig('frontlane-frontdesk').a2aSessionMode).toBe('root-session');
     expect(readContainerConfig('frontlane-access-worker').a2aSessionMode).toBe('root-session');
   });
+
+  it('writes conservative default resources for frontdesk and workers', async () => {
+    await run([]);
+
+    const frontdeskResources = readContainerConfig('frontlane-frontdesk').resources;
+    expect(frontdeskResources).toEqual({ memoryMb: 768, cpus: 1, pidsLimit: 384 });
+
+    const workerResources = readContainerConfig('frontlane-access-worker').resources;
+    expect(workerResources).toEqual({ memoryMb: 1024, cpus: 1, pidsLimit: 512 });
+  });
+
+  it('does not clobber hand-tuned resource caps on rerun', async () => {
+    // First init sets the defaults.
+    await run([]);
+
+    // Operator hand-edits container.json — raises worker memory, lowers cpus.
+    const { writeContainerConfig } = await import('../src/container-config.js');
+    const cfg = readContainerConfig('frontlane-access-worker');
+    cfg.resources = { memoryMb: 4096, cpus: 0.5, pidsLimit: 1024 };
+    writeContainerConfig('frontlane-access-worker', cfg);
+
+    // Rerun the init — must leave the operator's choices alone.
+    await run([]);
+
+    const after = readContainerConfig('frontlane-access-worker').resources;
+    expect(after).toEqual({ memoryMb: 4096, cpus: 0.5, pidsLimit: 1024 });
+  });
 });

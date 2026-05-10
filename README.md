@@ -43,7 +43,7 @@
 
 - 支持 OpenAI compatible provider
 - 容器侧 lazy idle-exit：`FRONTLANE_IDLE_EXIT_MS` 配置后，闲置容器主动退出释放内存，同用户连续对话仍复用热容器
-- Per-agent-group Docker 资源限制：`container.json` 里的 `resources.memoryMb / cpus / pidsLimit` 对应 docker run 的 `--memory / --cpus / --pids-limit`
+- Per-agent-group Docker 资源限制：`container.json` 里的 `resources.memoryMb / cpus / pidsLimit` 对应 docker run 的 `--memory / --cpus / --pids-limit`。`pnpm init:enterprise` 默认给 frontdesk 写 `{memoryMb:768, cpus:1, pidsLimit:384}`、给 worker 写 `{memoryMb:1024, cpus:1, pidsLimit:512}`，防止死循环 agent 吃光 host；手动编辑后再跑 init 不会被覆盖
 
 **运维与可观测**
 

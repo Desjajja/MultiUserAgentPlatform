@@ -335,7 +335,34 @@ Operating rules:
 `;
 }
 
-function ensureAgentGroup(folder: string, name: string, instructions: string, now: string): AgentGroup {
+/**
+ * Conservative default container resource caps, applied when a new
+ * agent group is created by this script. Each role gets a separate
+ * budget so frontdesk (classify + delegate, light) stays smaller than
+ * workers (may run tool calls / agent-browser / heavier reasoning).
+ *
+ * These are *defaults*: ensureAgentGroup only writes them when
+ * container.json has no `resources` field yet. An operator who
+ * hand-edits container.json or raises the caps later is never
+ * overwritten by a script re-run.
+ *
+ * Without these, a runaway agent can exhaust host memory or fork-bomb
+ * the kernel. See container-config.ts ContainerResourceLimits.
+ */
+type AgentRole = 'frontdesk' | 'worker';
+
+const DEFAULT_RESOURCES: Record<AgentRole, { memoryMb: number; cpus: number; pidsLimit: number }> = {
+  frontdesk: { memoryMb: 768, cpus: 1, pidsLimit: 384 },
+  worker: { memoryMb: 1024, cpus: 1, pidsLimit: 512 },
+};
+
+function ensureAgentGroup(
+  folder: string,
+  name: string,
+  instructions: string,
+  now: string,
+  role: AgentRole = 'worker',
+): AgentGroup {
   let group = getAgentGroupByFolder(folder);
   if (!group && folder === DEFAULT_FRONTDESK_FOLDER) {
     group = getAgentGroupByFolder(LEGACY_FRONTDESK_FOLDER);
@@ -361,6 +388,12 @@ function ensureAgentGroup(folder: string, name: string, instructions: string, no
   initGroupFilesystem(group, { instructions });
   updateContainerConfig(group.folder, (config) => {
     config.a2aSessionMode = 'root-session';
+    // Only fill resources when the operator hasn't set anything — never
+    // clobber hand-tuned caps. Covers the "first-time init" case where a
+    // new enterprise deployment otherwise runs unbounded.
+    if (!config.resources) {
+      config.resources = { ...DEFAULT_RESOURCES[role] };
+    }
   });
   return group;
 }
@@ -488,10 +521,11 @@ export async function run(argv: string[]): Promise<void> {
     args.frontdeskName,
     buildFrontdeskInstructions(args.frontdeskName, workerSpecs),
     now,
+    'frontdesk',
   );
 
   const workers = workerSpecs.map((worker) =>
-    ensureAgentGroup(worker.folder, worker.displayName, buildWorkerInstructions(worker), now),
+    ensureAgentGroup(worker.folder, worker.displayName, buildWorkerInstructions(worker), now, 'worker'),
   );
 
   for (let i = 0; i < workerSpecs.length; i++) {
