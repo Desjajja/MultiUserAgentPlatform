@@ -63,6 +63,13 @@ export const askUserQuestion: McpToolDefinition = {
           description: 'Options for the user to choose from (string or {label, selectedLabel?, value?})',
         },
         timeout: { type: 'number', description: 'Timeout in seconds (default: 300)' },
+        classificationId: {
+          type: 'string',
+          description:
+            'Optional but strongly recommended when the question is a disambiguation step after calling ' +
+            '`classify_intent` with action=clarify: the id returned by that call. Lets the platform link this ' +
+            'clarification back to the classification that authorized it.',
+        },
       },
       required: ['title', 'question', 'options'],
     },
@@ -86,8 +93,22 @@ export const askUserQuestion: McpToolDefinition = {
       };
     });
 
+    const classificationId =
+      typeof args.classificationId === 'string' && args.classificationId.length > 0
+        ? args.classificationId
+        : undefined;
+
     const questionId = generateId();
     const r = routing();
+
+    const contentObj: Record<string, unknown> = {
+      type: 'ask_question',
+      questionId,
+      title,
+      question,
+      options,
+    };
+    if (classificationId) contentObj._classificationId = classificationId;
 
     // Write question card to outbound.db
     writeMessageOut({
@@ -96,13 +117,7 @@ export const askUserQuestion: McpToolDefinition = {
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
-      content: JSON.stringify({
-        type: 'ask_question',
-        questionId,
-        title,
-        question,
-        options,
-      }),
+      content: JSON.stringify(contentObj),
     });
 
     log(`ask_user_question: ${questionId} → "${question}" [${options.join(', ')}]`);

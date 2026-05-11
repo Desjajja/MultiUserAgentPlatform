@@ -30,6 +30,19 @@
  *       container-provider error counter. Emitted via the delivery path when
  *       the container reports an error; left at zero when nothing registers.
  *
+ *   - frontlane_classifications_total{action}
+ *       counter of frontdesk classify_intent calls by declared action.
+ *
+ *   - frontlane_classification_bypass_total{reason,surface}
+ *       counter of agent-destination deliveries (or clarifications) that
+ *       had no matching prior classify_intent call. Persistent non-zero
+ *       rate means frontdesk is skipping the REQUIRED tool and silently
+ *       routing — fail-open observability for the classification
+ *       protocol.
+ *
+ *   - frontlane_classification_log_failures_total{reason}
+ *       classification rows lost to DB write errors. Alert on non-zero.
+ *
  * The /metrics endpoint is attached to the shared webhook server so it
  * lives at the same port as adapters' callbacks.
  */
@@ -60,6 +73,41 @@ export const sessionLifecycleTotal = new client.Counter({
   name: 'frontlane_session_lifecycle_total',
   help: 'Session lifecycle transitions applied by the sweep',
   labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+export const classificationsTotal = new client.Counter({
+  name: 'frontlane_classifications_total',
+  help: 'Frontdesk classification events by the agent-declared action',
+  // `action`: delegate | clarify | reject | answer_self. Lets dashboards
+  // show the routing mix at a glance and notice skew (e.g. a sudden
+  // drop in `clarify` often means the frontdesk started over-trusting
+  // a prompt change).
+  labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+export const classificationBypassTotal = new client.Counter({
+  name: 'frontlane_classification_bypass_total',
+  help: 'Routing actions that lacked a matching prior classify_intent call',
+  // `reason`:
+  //   - `no_classification_id`   : send_message/ask_user_question
+  //                                 did not pass classificationId
+  //   - `classification_not_found`: id passed but not in the log
+  //   - `action_mismatch`        : classification said e.g. clarify but
+  //                                 the actual outbound was an a2a send
+  // `surface`: agent_send | channel_send | ask_user_question
+  labelNames: ['reason', 'surface'] as const,
+  registers: [registry],
+});
+
+export const classificationLogFailuresTotal = new client.Counter({
+  name: 'frontlane_classification_log_failures_total',
+  help: 'Classification log writes that failed (DB error, etc.)',
+  // Dashboard panel for this should alert on any non-zero rate — the
+  // table is the regression corpus, silent drops here invalidate later
+  // analysis.
+  labelNames: ['reason'] as const,
   registers: [registry],
 });
 

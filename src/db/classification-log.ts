@@ -1,9 +1,13 @@
 import { getDb } from './connection.js';
 
 export interface ClassificationLogEntry {
+  classificationId?: string | null;
   sessionId?: string | null;
   agentGroupId?: string | null;
   userId?: string | null;
+  channelType?: string | null;
+  platformId?: string | null;
+  threadId?: string | null;
   userMessage?: string | null;
   recommendedWorker?: string | null;
   confidence?: number | null;
@@ -17,15 +21,20 @@ export function recordClassification(entry: ClassificationLogEntry, now: Date = 
   getDb()
     .prepare(
       `INSERT INTO classification_log
-         (occurred_at, session_id, agent_group_id, user_id, user_message,
+         (occurred_at, classification_id, session_id, agent_group_id, user_id,
+          channel_type, platform_id, thread_id, user_message,
           recommended_worker, confidence, candidates, reasoning, action, outcome_ref)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       now.toISOString(),
+      entry.classificationId ?? null,
       entry.sessionId ?? null,
       entry.agentGroupId ?? null,
       entry.userId ?? null,
+      entry.channelType ?? null,
+      entry.platformId ?? null,
+      entry.threadId ?? null,
       entry.userMessage ? entry.userMessage.slice(0, 500) : null,
       entry.recommendedWorker ?? null,
       entry.confidence ?? null,
@@ -34,6 +43,34 @@ export function recordClassification(entry: ClassificationLogEntry, now: Date = 
       entry.action,
       entry.outcomeRef ?? null,
     );
+}
+
+/**
+ * Look up a classification by the id the tool returned. Returns the row
+ * or undefined. Used by the delivery path to find a prior classification
+ * and stamp outcome_ref on it.
+ */
+export function findClassificationById(classificationId: string): Record<string, unknown> | undefined {
+  return getDb()
+    .prepare('SELECT * FROM classification_log WHERE classification_id = ? LIMIT 1')
+    .get(classificationId) as Record<string, unknown> | undefined;
+}
+
+/**
+ * Stamp `outcome_ref` onto an existing row. Idempotent: if outcome_ref
+ * is already set (earlier delivery already linked something) we leave
+ * it alone — the first delivery wins. Returns true when we actually
+ * wrote.
+ */
+export function linkOutcome(classificationId: string, outcomeRef: string): boolean {
+  const info = getDb()
+    .prepare(
+      `UPDATE classification_log
+         SET outcome_ref = ?
+         WHERE classification_id = ? AND (outcome_ref IS NULL OR outcome_ref = '')`,
+    )
+    .run(outcomeRef, classificationId);
+  return info.changes > 0;
 }
 
 export interface ClassificationQueryOptions {

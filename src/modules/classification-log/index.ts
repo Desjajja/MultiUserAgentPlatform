@@ -16,6 +16,7 @@
 import { registerDeliveryAction } from '../../delivery.js';
 import { recordClassification, type ClassificationLogEntry } from '../../db/classification-log.js';
 import { log } from '../../log.js';
+import { classificationLogFailuresTotal, classificationsTotal } from '../../metrics.js';
 import type { Session } from '../../types.js';
 
 const ACTIONS: ReadonlyArray<ClassificationLogEntry['action']> = ['delegate', 'clarify', 'reject', 'answer_self'];
@@ -46,10 +47,29 @@ function toAction(raw: unknown): ClassificationLogEntry['action'] {
 async function handleClassifyIntent(content: Record<string, unknown>, session: Session): Promise<void> {
   const action = toAction(content.action_taken);
 
+  // Prefer the session's owner_user_id (host-established identity) over
+  // whatever the agent wrote in the payload. If they disagree we warn
+  // and still trust session. Matters because this table is documented as
+  // audit-level ground truth — it can't take an agent-spoofable field
+  // at face value.
+  const claimedUserId = readString(content, 'userId') ?? null;
+  const trustedUserId = session.owner_user_id ?? claimedUserId ?? null;
+  if (claimedUserId && session.owner_user_id && claimedUserId !== session.owner_user_id) {
+    log.warn('classify_intent userId mismatch — trusting session owner', {
+      sessionId: session.id,
+      claimed: claimedUserId,
+      session: session.owner_user_id,
+    });
+  }
+
   const entry: ClassificationLogEntry = {
+    classificationId: readString(content, 'classificationId') ?? null,
     sessionId: session.id,
     agentGroupId: session.agent_group_id,
-    userId: readString(content, 'userId') ?? null,
+    userId: trustedUserId,
+    channelType: readString(content, 'channelType') ?? null,
+    platformId: readString(content, 'platformId') ?? null,
+    threadId: readString(content, 'threadId') ?? null,
     userMessage: readString(content, 'userMessage') ?? null,
     recommendedWorker: readString(content, 'recommendedWorker') ?? null,
     confidence: readNumber(content, 'confidence') ?? null,
@@ -62,8 +82,12 @@ async function handleClassifyIntent(content: Record<string, unknown>, session: S
   try {
     recordClassification(entry);
   } catch (err) {
+    classificationLogFailuresTotal.labels('write_error').inc();
     log.error('classification_log write failed', { sessionId: session.id, err });
+    return;
   }
+
+  classificationsTotal.labels(action).inc();
 }
 
 registerDeliveryAction('classify_intent', handleClassifyIntent);

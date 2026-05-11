@@ -72,4 +72,47 @@ describe('classification_log', () => {
     expect(row.candidates).toBeNull();
     expect(row.recommended_worker).toBeNull();
   });
+
+  it('stores channel/platform/thread identity alongside the row', () => {
+    recordClassification({
+      action: 'delegate',
+      classificationId: 'cls-001',
+      userId: 'feishu:ou_alice',
+      channelType: 'feishu',
+      platformId: 'feishu:p2p:ou_alice',
+      threadId: null,
+      recommendedWorker: 'finance-worker',
+      confidence: 0.9,
+    });
+    const row = queryClassificationLog()[0]!;
+    expect(row.classification_id).toBe('cls-001');
+    expect(row.channel_type).toBe('feishu');
+    expect(row.platform_id).toBe('feishu:p2p:ou_alice');
+    expect(row.thread_id).toBeNull();
+  });
+
+  it('findClassificationById returns the row by id and undefined when missing', async () => {
+    const { findClassificationById } = await import('./classification-log.js');
+    recordClassification({ action: 'delegate', classificationId: 'cls-findme', recommendedWorker: 'w-1' });
+    const hit = findClassificationById('cls-findme');
+    expect(hit?.recommended_worker).toBe('w-1');
+    expect(findClassificationById('cls-does-not-exist')).toBeUndefined();
+  });
+
+  it('linkOutcome stamps outcome_ref on the first call and is idempotent thereafter', async () => {
+    const { findClassificationById, linkOutcome } = await import('./classification-log.js');
+    recordClassification({ action: 'delegate', classificationId: 'cls-link-1' });
+
+    expect(linkOutcome('cls-link-1', 'msg-abc')).toBe(true);
+    expect(findClassificationById('cls-link-1')?.outcome_ref).toBe('msg-abc');
+
+    // Second link attempt must NOT overwrite — first delivery wins.
+    expect(linkOutcome('cls-link-1', 'msg-different')).toBe(false);
+    expect(findClassificationById('cls-link-1')?.outcome_ref).toBe('msg-abc');
+  });
+
+  it('linkOutcome returns false when classification id is unknown', async () => {
+    const { linkOutcome } = await import('./classification-log.js');
+    expect(linkOutcome('cls-nope', 'msg-whatever')).toBe(false);
+  });
 });

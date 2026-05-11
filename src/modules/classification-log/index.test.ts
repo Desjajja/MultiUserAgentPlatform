@@ -95,4 +95,46 @@ describe('classify_intent delivery action', () => {
     const rows = queryClassificationLog();
     expect(rows.map((r) => r.action).sort()).toEqual(['answer_self', 'clarify', 'delegate', 'reject']);
   });
+
+  it('trusts session.owner_user_id over agent-claimed userId', async () => {
+    const handler = captured.get('classify_intent')!;
+    const sess = session();
+    sess.owner_user_id = 'feishu:ou_real';
+    await handler(
+      {
+        action: 'classify_intent',
+        userMessage: 'who am I',
+        confidence: 0.9,
+        action_taken: 'delegate',
+        userId: 'feishu:ou_forged',
+      },
+      sess,
+      {} as never,
+    );
+    const row = queryClassificationLog()[0]!;
+    expect(row.user_id).toBe('feishu:ou_real');
+  });
+
+  it('persists channel/platform/thread fields from the payload', async () => {
+    const handler = captured.get('classify_intent')!;
+    await handler(
+      {
+        action: 'classify_intent',
+        classificationId: 'cls-42',
+        userMessage: 'hello',
+        confidence: 0.8,
+        action_taken: 'delegate',
+        channelType: 'feishu',
+        platformId: 'feishu:oc_group_1',
+        threadId: 'thread-7',
+      },
+      session(),
+      {} as never,
+    );
+    const row = queryClassificationLog()[0]!;
+    expect(row.classification_id).toBe('cls-42');
+    expect(row.channel_type).toBe('feishu');
+    expect(row.platform_id).toBe('feishu:oc_group_1');
+    expect(row.thread_id).toBe('thread-7');
+  });
 });

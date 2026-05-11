@@ -125,6 +125,14 @@ export const sendMessage: McpToolDefinition = {
           description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.',
         },
         text: { type: 'string', description: 'Message content' },
+        classificationId: {
+          type: 'string',
+          description:
+            'Optional but strongly recommended when delegating to a worker: the id returned by your preceding ' +
+            '`classify_intent` call. Lets the platform link this delivery back to the classification that ' +
+            'authorized it. Missing id on an agent-destination send is treated as an un-classified delegation ' +
+            'and counted against the bypass metric.',
+        },
       },
       required: ['text'],
     },
@@ -136,6 +144,16 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
+    const classificationId =
+      typeof args.classificationId === 'string' && args.classificationId.length > 0
+        ? args.classificationId
+        : undefined;
+    // Put classificationId in content (not outbound columns) so channel
+    // adapters never have to look at it — only the host a2a / system
+    // path cares. Inbound parsers ignore unknown top-level keys.
+    const contentObj: Record<string, unknown> = { text };
+    if (classificationId) contentObj._classificationId = classificationId;
+
     const id = generateId();
     const seq = writeMessageOut({
       id,
@@ -144,11 +162,11 @@ export const sendMessage: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text }),
+      content: JSON.stringify(contentObj),
       origin_user_id: a2aOriginUserId(routing.channel_type),
     });
 
-    log(`send_message: #${seq} → ${routing.resolvedName}`);
+    log(`send_message: #${seq} → ${routing.resolvedName}${classificationId ? ` cls=${classificationId}` : ''}`);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
 };

@@ -11,6 +11,7 @@ import type Database from 'better-sqlite3';
 
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { findClassificationById, linkOutcome } from './db/classification-log.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
@@ -21,6 +22,7 @@ import {
   migrateDeliveredTable,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { classificationBypassTotal } from './metrics.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { markProgressStatusCompleted, markProgressStatusFailed } from './modules/progress-status/index.js';
@@ -270,6 +272,14 @@ async function deliverMessage(
     if (!hasTable(getDb(), 'agent_destinations')) {
       throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
     }
+    // Classification loop-close: when frontdesk delegates, the outbound
+    // should carry the classificationId from its preceding classify_intent
+    // call. Stamp outcome_ref on that row (for the regression corpus) and
+    // count any bypass (missing / stale id, action mismatch) so we can
+    // see on /metrics when the LLM skips the REQUIRED tool.
+    if (hasTable(getDb(), 'classification_log')) {
+      reconcileClassification(content, msg.id, 'agent_send');
+    }
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
     await routeAgentMessage(msg, session);
     return;
@@ -313,6 +323,13 @@ async function deliverMessage(
         );
       }
     }
+  }
+
+  // Classification loop-close for clarification cards. When frontdesk
+  // says action=clarify, the card it emits via ask_user_question should
+  // carry the classificationId; reconcile here so outcome_ref gets stamped.
+  if (content.type === 'ask_question' && hasTable(getDb(), 'classification_log')) {
+    reconcileClassification(content, msg.id, 'ask_user_question');
   }
 
   // Track pending questions for ask_user_question flow.
@@ -405,6 +422,60 @@ export function registerDeliveryAction(action: string, handler: DeliveryActionHa
     log.warn('Delivery action handler overwritten', { action });
   }
   actionHandlers.set(action, handler);
+}
+
+/**
+ * Reconcile a routing action against the classify_intent log.
+ *
+ * Called when frontdesk is about to delegate (a2a send_message) or
+ * clarify (ask_user_question). Three paths:
+ *
+ *   1. No classificationId on the outbound → bump bypass counter with
+ *      `reason=no_classification_id`. The agent skipped the required
+ *      tool call. Still deliver — this is observability, not
+ *      enforcement.
+ *   2. classificationId present but not in the log → the id is stale
+ *      or made up. Bump `classification_not_found`.
+ *   3. classificationId matches a log row → stamp outcome_ref with the
+ *      delivery's outbound message id. Also check that the row's
+ *      declared action matches the actual surface (delegate ↔ agent_send,
+ *      clarify ↔ ask_user_question); bump `action_mismatch` otherwise.
+ *
+ * Kept deliberately cheap: one index lookup per agent/ask outbound.
+ * Don't throw — a failure in this audit-ish path should never block
+ * real user traffic.
+ */
+export function reconcileClassification(
+  content: Record<string, unknown>,
+  outcomeRef: string,
+  surface: 'agent_send' | 'ask_user_question',
+): void {
+  try {
+    const raw = content._classificationId;
+    const classificationId = typeof raw === 'string' && raw.length > 0 ? raw : null;
+    if (!classificationId) {
+      classificationBypassTotal.labels('no_classification_id', surface).inc();
+      return;
+    }
+    const row = findClassificationById(classificationId);
+    if (!row) {
+      classificationBypassTotal.labels('classification_not_found', surface).inc();
+      return;
+    }
+    const declared = typeof row.action === 'string' ? row.action : '';
+    const expected = surface === 'agent_send' ? 'delegate' : 'clarify';
+    if (declared !== expected) {
+      classificationBypassTotal.labels('action_mismatch', surface).inc();
+      // Intentionally still stamp outcome_ref below — the link is more
+      // valuable than the mismatch guard. Analytics can filter on
+      // declared=delegate + stamped surface=ask_user_question to spot
+      // the exact inconsistency.
+    }
+    linkOutcome(classificationId, outcomeRef);
+  } catch (err) {
+    // Never block delivery on audit bookkeeping.
+    log.warn('classify_intent reconciliation failed', { err });
+  }
 }
 
 /**

@@ -39,6 +39,16 @@ function generateId(): string {
 }
 
 /**
+ * Stable id that frontdesk returns to the agent, and that send_message /
+ * ask_user_question later accept as `classificationId` to close the loop.
+ * Distinct from the outbound row id so the schema doesn't leak the
+ * storage layer. Shape chosen so it sorts lexicographically by time.
+ */
+function generateClassificationId(): string {
+  return `cls-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
  * Lightweight rule: how should the agent interpret its own confidence?
  * Returned as part of the tool response so the prompt can just read the
  * advisory instead of re-deriving the thresholds in natural language.
@@ -137,24 +147,49 @@ export const classifyIntent: McpToolDefinition = {
     if (Number.isNaN(confidence)) return err('confidence must be a number in [0, 1]');
 
     const identity = getRequestIdentity();
+    const classificationId = generateClassificationId();
+
+    // De-duplicate candidates so a reviewer counting "multiple plausible
+    // workers" can't be fooled by the LLM listing recommendedWorker both
+    // as top pick and in the candidates array. This also tightens the
+    // confidenceAdvisory() branch that triggers on > 1 candidates.
+    const distinctCandidates = Array.from(
+      new Set([...(recommendedWorker ? [recommendedWorker] : []), ...candidates]),
+    );
+
     writeMessageOut({
       id: generateId(),
       kind: 'system',
       content: JSON.stringify({
         action: 'classify_intent',
+        classificationId,
         userId: identity?.userId ?? null,
+        // Preserve the full channel/thread context on the audit row.
+        // Without these, later analytics can't slice "what did
+        // frontdesk classify in this thread / this channel" without
+        // awkward joins.
+        channelType: identity?.channelType ?? null,
+        platformId: identity?.platformId ?? null,
+        threadId: identity?.threadId ?? null,
         userMessage: userMessage.slice(0, 500),
         recommendedWorker,
         confidence,
-        candidates,
+        candidates: distinctCandidates,
         reasoning,
         action_taken: action,
       }),
     });
 
-    const advisory = confidenceAdvisory(confidence, candidates.length + (recommendedWorker ? 1 : 0));
-    log(`classify_intent: worker=${recommendedWorker ?? 'none'} conf=${confidence.toFixed(2)} action=${action}`);
-    return ok(advisory);
+    const advisory = confidenceAdvisory(confidence, distinctCandidates.length);
+    log(
+      `classify_intent: id=${classificationId} worker=${recommendedWorker ?? 'none'} conf=${confidence.toFixed(2)} action=${action}`,
+    );
+    // Return structure instead of a plain string so the agent can thread
+    // `classificationId` into the next send_message / ask_user_question
+    // call. Advisory stays at the top for natural-language salience.
+    return ok(
+      `${advisory}\n\nclassificationId: ${classificationId} — pass this id as the \`classificationId\` argument to your next \`send_message\` or \`ask_user_question\` call so the platform can link this classification to its outcome.`,
+    );
   },
 };
 
