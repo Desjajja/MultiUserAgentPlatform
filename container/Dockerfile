@@ -105,11 +105,22 @@ RUN pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # lark-cli — Feishu OpenAPI client used by the feishu-base / feishu-comm /
 # feishu-doc workers. Baked into the base image so every spawn has it on
-# PATH without needing a per-agent install_packages approval. Pinned to
-# "latest" because @larksuite/cli ships infrequently and the workers'
-# SKILL.md instructions are version-tolerant.
+# PATH without needing a per-agent install_packages approval.
+#
+# @larksuite/cli is a 2-stage install:
+#   1. pnpm install -g           — drops the run.js wrapper into bin/
+#   2. first lark-cli invocation — downloads the native binary into the
+#      package's own node_modules/@larksuite/cli/bin/ directory.
+#
+# We trigger stage 2 during build (as root, with network) so the runtime
+# user (`node`) sees a fully-installed CLI on first invocation. The
+# `|| true` is defensive: lark-cli --version exits non-zero on some setups
+# but still completes the binary download; we'd rather not fail the whole
+# build for that.
 ARG LARK_CLI_VERSION=latest
-RUN pnpm install -g "@larksuite/cli@${LARK_CLI_VERSION}"
+RUN pnpm install -g "@larksuite/cli@${LARK_CLI_VERSION}" && \
+    (lark-cli --version || true) && \
+    chmod -R a+rX /pnpm
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
