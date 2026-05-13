@@ -1,0 +1,5 @@
+[
+  {"task": "测试机器人设备", "priority": "P0", "status": "pending"},
+  {"task": "检查传感器状态", "priority": "P1", "status": "pending"},
+  {"task": "整理实验记录", "priority": "P2", "status": "pending"}
+]

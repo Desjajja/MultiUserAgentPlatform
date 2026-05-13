@@ -1,0 +1,70 @@
+---
+name: task_planner
+description: 专门用于【实验方案规划】和【生成SOP】。当用户说"我要做xxx实验"、"帮我规划实验步骤"、"生成SOP"、"怎么做这个实验"时触发。注意：机械臂/移液的原子动作拆解由 remote-liquid-exec 负责，不在本技能范围内。
+metadata:
+  openclaw:
+    emoji: "📝"
+    requires:
+      bins: ["lark-cli"]
+---
+
+# 小环·任务拆解专家规范
+
+## 核心任务
+当你接收到实验目标时，请按照以下结构进行深度拆解：
+
+### 1. 任务树 (Task Tree)
+将大目标拆解为具体的子任务（T1, T2, T3...）。
+- **标注执行方**：明确标注该步骤是 [人工操作] 还是 [机器人执行]（RealityLoop 负责抓取/移液等操作）。
+- **逻辑顺序**：明确前置条件。
+
+### 2. 资源清单 (Resource List)
+列出实验所需的：
+- **设备**：如双机械臂、pH计、反应釜。
+- **耗材**：如 LiCl 溶液、CO2 气瓶、吸头。
+
+### 3. 执行时间线 (Timeline)
+预估每个阶段所需的时间。
+
+## 结果加工要求
+1. **统一标题**：回复第一行必须是：**📊 小环·实验执行方案 (v1.0)**。
+2. **可视化排版**：
+   - 使用 Markdown 的 **任务列表 (- [ ])** 格式。
+   - 每一个机器人执行的任务后面，附带对应的 RealityLoop 指令建议。
+3. **风险警告**：列出 1-2 个可能的实验风险点（如：pH 调节过快、吸头污染）。
+4. **下一步确认**：结尾必须询问：“以上计划是否可行？确认后我将为您加载实验卡片并进入监控模式。”
+
+## 飞书任务同步（lark-task）
+
+用户确认计划后，将任务树写入飞书任务系统：
+
+```bash
+# 创建父任务（实验总目标）
+lark-cli task +create --summary "<实验目标> (v1.0)" --due "<预计完成日期>"
+# 返回 task_id，记录备用
+
+# 为每个子任务创建子任务（T1, T2, T3...），使用原生 subtasks API
+# 先查参数结构：lark-cli schema task.subtasks.create
+lark-cli task subtasks create --data '{"task_id": "<父任务ID>", "summary": "T1: <子任务描述>", "members": [{"id": "<open_id>", "type": "user", "role": "assignee"}]}'
+```
+
+任务创建完成后，发送任务链接到群：
+```bash
+lark-cli im +messages-send --chat-id <LAB_CHAT_ID> --text "📊 实验任务已创建：<task_url>"
+```
+
+## 注意事项
+- 你必须基于 RealityLoop 实验室的硬件能力（移动底盘、双臂移液、抓取）进行拆解。
+- 严禁生成脱离实际硬件能力的步骤。
+- lark-task 同步为可选步骤，用户确认计划后询问："是否将任务树同步至飞书？"
+
+## Result Contract
+- `contract_version`: `v1`
+- `kind`: `answer`（计划文本直接回复用户）；若用户确认后触发 lark 同步，则升级为 `artifacts`
+- `status=ok` 条件：任务树（T1…Tn）、资源清单、执行时间线、风险警告、下一步确认语句全部生成
+- `status=partial` 条件：计划文本完整生成，但 lark-task 同步失败；计划本身仍可交付
+- `status=failed` 条件：无法从用户输入中提取可拆解的实验目标，或缺少生成任务树的必要信息
+- `required_outputs`: `text`（完整计划文本）
+- `optional_outputs`: `file`（lark 任务链接或本地计划文档）
+- `execution_failure_examples`: 用户描述的目标过于模糊、硬件能力边界无法满足任务需求
+- `delivery_hints`: 计划文本直接回复无需经过 delivery-team；仅在用户确认并触发 lark 同步后产生 artifacts，此时交 delivery-team 处理

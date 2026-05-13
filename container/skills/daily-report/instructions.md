@@ -1,0 +1,69 @@
+---
+name: daily_report
+description: 生成每日总结与日报。当用户说"给我日报"、"生成报告"、"总结今天"、"下班了"时触发。
+metadata:
+  openclaw:
+    emoji: "📝"
+    requires:
+      bins: ["lark-cli"]
+---
+
+# 小环·每日工作汇总规范
+
+## 运行流程
+1. **数据提取**：执行 `python3 {baseDir}/bridge.py`。
+2. **全局回顾**：回顾今天的对话历史（重点看任务 2 的情报、任务 7 的异常、任务 8 的归档）。
+
+## 结果加工要求（飞书日报版）
+请生成一份排版精美、可直接转发的日报：
+
+1. **标题**：**🗓️ 小环·科研助理工作日报 ({今日日期})**
+2. **今日成就**：
+   - 概括今天完成的核心实验（如：CO2 提锂动力学探索）。
+   - 列出完成的 2-3 个关键子任务。
+3. **科研动态**：
+   - 简述今天通过 arXiv 关注到的 1 条最重要情报。
+4. **异常与闭环**：
+   - 记录今天发生的异常（如 pH 超调）及其处理结果，体现系统的鲁棒性。
+5. **硬件健康度**：
+   - 展示机器人运行总时长和当前电量。
+6. **明日计划**：
+   - 基于 `lark-task`（见下）列出明天的优先级 P0/P1 任务。
+
+## 飞书输出（二选一，优先用 lark-doc）
+
+### 方式 A：创建飞书云文档存档（推荐）
+```bash
+# 将日报内容写入飞书云文档
+lark-cli docs +create --title “小环日报 {今日日期}” --markdown “<日报 Markdown 内容>”
+```
+文档创建后，将链接通过消息发送到群：
+```bash
+lark-cli im +messages-send --chat-id <LAB_CHAT_ID> --text “📝 今日日报已生成：<doc_url>”
+```
+
+### 方式 B：直接发飞书消息（快速模式）
+```bash
+lark-cli im +messages-send --chat-id <LAB_CHAT_ID> --text “<日报 Markdown 内容>”
+```
+
+## 视觉风格
+- 使用 Markdown 的 **加粗** 和 **Emoji**。
+- 分割线 `---` 区分不同模块。
+- 结尾加上：**”数据已同步至 192.168.1.106 数据库，小环祝您晚安。”**
+
+## 注意事项
+- 严禁流水账，要有重点。
+- 如果实验失败了，日报中要体现原因分析，而不是掩盖。
+- 必须确认所有数据已安全归档（任务 8 已执行）。
+
+## Result Contract
+- `contract_version`: `v1`
+- `kind`: `artifacts`
+- `status=ok` 条件：`text` 和 `file` 两类结构化产物都已生成，内容可直接交付
+- `status=partial` 条件：`text` 和 `file` 已生成，但首选同步目标降级为本地文件或待后续转发；仍保留可交付产物
+- `status=failed` 条件：日报正文无法生成，或 Markdown/文档产物未生成，导致不满足最小交付条件
+- `required_outputs`：`text`, `file`
+- `optional_outputs`：`forward`
+- `execution_failure_examples`：bridge.py 失败、历史数据不足以生成日报、文档产物创建失败且无本地文件降级
+- `delivery_hints`：先交付 `text` 和 `file`，`forward` 仅用于群组同步；转发失败由 Harness 记为 `delivery_failure`
