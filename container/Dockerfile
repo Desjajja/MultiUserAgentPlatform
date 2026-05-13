@@ -103,6 +103,14 @@ RUN pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
 RUN pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+# lark-cli — Feishu OpenAPI client used by the feishu-base / feishu-comm /
+# feishu-doc workers. Baked into the base image so every spawn has it on
+# PATH without needing a per-agent install_packages approval. Pinned to
+# "latest" because @larksuite/cli ships infrequently and the workers'
+# SKILL.md instructions are version-tolerant.
+ARG LARK_CLI_VERSION=latest
+RUN pnpm install -g "@larksuite/cli@${LARK_CLI_VERSION}"
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
