@@ -80,7 +80,7 @@ export interface ContainerResourceLimits {
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
   enterpriseGateway?: EnterpriseGatewayConfig;
-  packages: { apt: string[]; npm: string[] };
+  packages: { apt: string[]; npm: string[]; pip?: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
   /** Which skills to enable — array of skill names or "all" (default). */
@@ -168,6 +168,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       packages: {
         apt: raw.packages?.apt ?? [],
         npm: raw.packages?.npm ?? [],
+        pip: raw.packages?.pip,
       },
       imageTag: raw.imageTag,
       additionalMounts: raw.additionalMounts ?? [],

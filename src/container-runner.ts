@@ -574,16 +574,32 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   if (!agentGroup) throw new Error('Agent group not found');
 
   const containerConfig = readContainerConfig(agentGroup.folder);
-  const aptPackages = containerConfig.packages.apt;
+  const aptPackages = containerConfig.packages.apt.slice();
   const npmPackages = containerConfig.packages.npm;
+  const pipPackages = containerConfig.packages.pip ?? [];
 
-  if (aptPackages.length === 0 && npmPackages.length === 0) {
+  if (aptPackages.length === 0 && npmPackages.length === 0 && pipPackages.length === 0) {
     throw new Error('No packages to install. Use install_packages first.');
+  }
+
+  // If pip packages requested, auto-add python3 + python3-pip to apt so the
+  // pip install step finds an interpreter and package manager. Idempotent —
+  // skip if already in the list.
+  if (pipPackages.length > 0) {
+    if (!aptPackages.includes('python3')) aptPackages.push('python3');
+    if (!aptPackages.includes('python3-pip')) aptPackages.push('python3-pip');
   }
 
   let dockerfile = `FROM ${CONTAINER_IMAGE}\nUSER root\n`;
   if (aptPackages.length > 0) {
     dockerfile += `RUN apt-get update && apt-get install -y ${aptPackages.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
+  }
+  if (pipPackages.length > 0) {
+    // Debian 12+ marks the system Python as externally-managed (PEP 668).
+    // --break-system-packages is the documented workaround for installing
+    // into the system site-packages — fine here since each agent container
+    // is an isolated environment, not a shared system.
+    dockerfile += `RUN python3 -m pip install --break-system-packages --no-cache-dir ${pipPackages.join(' ')}\n`;
   }
   if (npmPackages.length > 0) {
     // pnpm skips build scripts unless packages are allowlisted. Append each
@@ -597,7 +613,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
 
   const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
 
-  log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
+  log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages, pip: pipPackages });
 
   // Write Dockerfile to temp file and build
   const tmpDockerfile = path.join(DATA_DIR, `Dockerfile.${agentGroupId}`);

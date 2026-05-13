@@ -97,3 +97,35 @@ describe('container resources normalization', () => {
     expect(cfg.resources).toBeUndefined();
   });
 });
+
+describe('container packages — pip field', () => {
+  it('parses pip array when present', () => {
+    const groupDir = path.join(tmpState.root, 'groups', 'pip-g1');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(groupDir, 'container.json'),
+      JSON.stringify({
+        packages: { apt: ['python3'], npm: [], pip: ['paho-mqtt', 'requests'] },
+      }),
+    );
+
+    const cfg = readContainerConfig('pip-g1');
+    expect(cfg.packages.pip).toEqual(['paho-mqtt', 'requests']);
+    expect(cfg.packages.apt).toEqual(['python3']);
+  });
+
+  it('leaves pip undefined when absent (backwards-compat with apt/npm-only configs)', () => {
+    const groupDir = path.join(tmpState.root, 'groups', 'pip-g2');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(groupDir, 'container.json'),
+      JSON.stringify({
+        packages: { apt: ['ffmpeg'], npm: [] },
+      }),
+    );
+
+    const cfg = readContainerConfig('pip-g2');
+    expect(cfg.packages.pip).toBeUndefined();
+    expect(cfg.packages.apt).toEqual(['ffmpeg']);
+  });
+});

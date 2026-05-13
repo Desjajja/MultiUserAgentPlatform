@@ -34,18 +34,20 @@ function err(text: string) {
 
 const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
 const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+const PIP_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 const MAX_PACKAGES = 20;
 
 export const installPackages: McpToolDefinition = {
   tool: {
     name: 'install_packages',
     description:
-      'Install apt and/or npm packages into YOUR per-agent container image. Requires admin approval; fire-and-forget. On approval, the image is rebuilt and the container is restarted automatically.',
+      'Install apt, npm, and/or pip packages into YOUR per-agent container image. Requires admin approval; fire-and-forget. On approval, the image is rebuilt and the container is restarted automatically. pip packages auto-install python3 + python3-pip via apt.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         apt: { type: 'array', items: { type: 'string' }, description: 'apt packages to install (names only, no version specs or flags)' },
         npm: { type: 'array', items: { type: 'string' }, description: 'npm packages to install globally (names only, no version specs)' },
+        pip: { type: 'array', items: { type: 'string' }, description: 'pip packages to install globally (names only, no version specs). python3 + python3-pip are auto-installed via apt.' },
         reason: { type: 'string', description: 'Why these packages are needed' },
       },
     },
@@ -53,13 +55,17 @@ export const installPackages: McpToolDefinition = {
   async handler(args) {
     const apt = (args.apt as string[]) || [];
     const npm = (args.npm as string[]) || [];
-    if (apt.length === 0 && npm.length === 0) return err('At least one apt or npm package is required');
-    if (apt.length + npm.length > MAX_PACKAGES) return err(`Maximum ${MAX_PACKAGES} packages per request`);
+    const pip = (args.pip as string[]) || [];
+    if (apt.length === 0 && npm.length === 0 && pip.length === 0)
+      return err('At least one apt, npm, or pip package is required');
+    if (apt.length + npm.length + pip.length > MAX_PACKAGES) return err(`Maximum ${MAX_PACKAGES} packages per request`);
 
     const invalidApt = apt.find((p) => !APT_RE.test(p));
     if (invalidApt) return err(`Invalid apt package name: "${invalidApt}". Only lowercase letters, digits, and ._+- allowed.`);
     const invalidNpm = npm.find((p) => !NPM_RE.test(p));
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
+    const invalidPip = pip.find((p) => !PIP_RE.test(p));
+    if (invalidPip) return err(`Invalid pip package name: "${invalidPip}". No version specs or shell characters.`);
 
     const requestId = generateId();
     writeMessageOut({
@@ -69,11 +75,12 @@ export const installPackages: McpToolDefinition = {
         action: 'install_packages',
         apt,
         npm,
+        pip,
         reason: (args.reason as string) || '',
       }),
     });
 
-    log(`install_packages: ${requestId} → apt=[${apt.join(',')}] npm=[${npm.join(',')}]`);
+    log(`install_packages: ${requestId} → apt=[${apt.join(',')}] npm=[${npm.join(',')}] pip=[${pip.join(',')}]`);
     return ok(`Package install request submitted. You will be notified when admin approves or rejects.`);
   },
 };

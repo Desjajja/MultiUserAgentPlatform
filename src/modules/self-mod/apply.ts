@@ -27,11 +27,15 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
   updateContainerConfig(agentGroup.folder, (cfg) => {
     if (payload.apt) cfg.packages.apt.push(...(payload.apt as string[]));
     if (payload.npm) cfg.packages.npm.push(...(payload.npm as string[]));
+    if (payload.pip) {
+      cfg.packages.pip = (cfg.packages.pip ?? []).concat(payload.pip as string[]);
+    }
   });
 
   const pkgs = [
     ...((payload.apt as string[] | undefined) || []),
     ...((payload.npm as string[] | undefined) || []),
+    ...((payload.pip as string[] | undefined) || []).map((p) => `pip:${p}`),
   ].join(', ');
   log.info('Package install approved', { agentGroupId: session.agent_group_id, userId });
   try {

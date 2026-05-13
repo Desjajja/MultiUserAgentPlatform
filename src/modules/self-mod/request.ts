@@ -26,16 +26,18 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
 
   const apt = (content.apt as string[]) || [];
   const npm = (content.npm as string[]) || [];
+  const pip = (content.pip as string[]) || [];
   const reason = (content.reason as string) || '';
 
   const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
   const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+  const PIP_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
   const MAX_PACKAGES = 20;
-  if (apt.length + npm.length === 0) {
-    notifyAgent(session, 'install_packages failed: at least one apt or npm package is required.');
+  if (apt.length + npm.length + pip.length === 0) {
+    notifyAgent(session, 'install_packages failed: at least one apt, npm, or pip package is required.');
     return;
   }
-  if (apt.length + npm.length > MAX_PACKAGES) {
+  if (apt.length + npm.length + pip.length > MAX_PACKAGES) {
     notifyAgent(session, `install_packages failed: max ${MAX_PACKAGES} packages per request.`);
     return;
   }
@@ -51,13 +53,23 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
     log.warn('install_packages: invalid npm package rejected', { pkg: invalidNpm });
     return;
   }
+  const invalidPip = pip.find((p) => !PIP_RE.test(p));
+  if (invalidPip) {
+    notifyAgent(session, `install_packages failed: invalid pip package name "${invalidPip}".`);
+    log.warn('install_packages: invalid pip package rejected', { pkg: invalidPip });
+    return;
+  }
 
-  const packageList = [...apt.map((p) => `apt: ${p}`), ...npm.map((p) => `npm: ${p}`)].join(', ');
+  const packageList = [
+    ...apt.map((p) => `apt: ${p}`),
+    ...npm.map((p) => `npm: ${p}`),
+    ...pip.map((p) => `pip: ${p}`),
+  ].join(', ');
   await requestApproval({
     session,
     agentName: agentGroup.name,
     action: 'install_packages',
-    payload: { apt, npm, reason },
+    payload: { apt, npm, pip, reason },
     title: 'Install Packages Request',
     question: `Agent "${agentGroup.name}" is attempting to install a package + rebuild container:\n${packageList}${reason ? `\nReason: ${reason}` : ''}`,
   });
