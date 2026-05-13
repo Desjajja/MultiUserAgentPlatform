@@ -11,3 +11,4 @@
 
 import './cli.js';
 import './feishu.js';
+import './mqtt.js';
