@@ -19,6 +19,7 @@ export interface MessageOutRow {
   thread_id: string | null;
   content: string;
   origin_user_id: string | null;
+  trace_id: string | null;
 }
 
 export interface WriteMessageOut {
@@ -39,6 +40,12 @@ export interface WriteMessageOut {
    * outbound — the host already has that identity from the inbound side.
    */
   origin_user_id?: string | null;
+  /**
+   * Per-turn trace identifier copied from the inbound this outbound is
+   * answering. Falls through to the trace id pinned for the current batch
+   * if not specified — see request-context's trace_id channel.
+   */
+  trace_id?: string | null;
 }
 
 /**
@@ -64,10 +71,27 @@ export function writeMessageOut(msg: WriteMessageOut): number {
 
   // bun:sqlite requires named parameters to be passed with the prefix character
   // in the JS object keys (better-sqlite3 auto-stripped it, bun:sqlite does not).
+  // If no explicit trace_id, fall back to the trace_id of the most recent
+  // pending inbound row — this stitches every outbound produced for the
+  // current turn back onto the originating trace from the host's ingress.
+  let resolvedTraceId: string | null = msg.trace_id ?? null;
+  if (resolvedTraceId === null) {
+    try {
+      const row = inbound
+        .prepare(
+          "SELECT trace_id FROM messages_in WHERE trace_id IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .get() as { trace_id: string | null } | undefined;
+      resolvedTraceId = row?.trace_id ?? null;
+    } catch {
+      /* old inbound.db without trace_id column — leave NULL */
+    }
+  }
+
   outbound
     .prepare(
-      `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content, origin_user_id)
-     VALUES ($id, $seq, $in_reply_to, datetime('now'), $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $content, $origin_user_id)`,
+      `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content, origin_user_id, trace_id)
+     VALUES ($id, $seq, $in_reply_to, datetime('now'), $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $content, $origin_user_id, $trace_id)`,
     )
     .run({
       $id: msg.id,
@@ -81,6 +105,7 @@ export function writeMessageOut(msg: WriteMessageOut): number {
       $thread_id: msg.thread_id ?? null,
       $content: msg.content,
       $origin_user_id: msg.origin_user_id ?? null,
+      $trace_id: resolvedTraceId,
     });
 
   return nextSeq;

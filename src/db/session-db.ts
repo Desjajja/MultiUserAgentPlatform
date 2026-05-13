@@ -22,6 +22,16 @@ export function openInboundDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');
+  // Forward-compat: add trace_id to existing inbound DBs that predate it.
+  // INBOUND_SCHEMA already includes the column for fresh DBs; this ALTER
+  // catches sessions whose inbound.db was created before this rollout.
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('trace_id')) {
+    db.exec('ALTER TABLE messages_in ADD COLUMN trace_id TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_messages_in_trace ON messages_in(trace_id)');
+  }
   return db;
 }
 
@@ -121,16 +131,24 @@ export function insertMessage(
      * content payload's senderId).
      */
     originUserId?: string | null;
+    /**
+     * Per-turn trace identifier propagated through the dispatch chain.
+     * Channel-side ingress generates a fresh uuid v4; a2a hops copy the
+     * source inbound's trace_id verbatim. Read by the Langfuse sidecar
+     * for cross-hop trace stitching.
+     */
+    traceId?: string | null;
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, origin_user_id)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @originUserId)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, origin_user_id, trace_id)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @originUserId, @traceId)`,
   ).run({
     ...message,
     trigger: message.trigger ?? 1,
     sourceSessionId: message.sourceSessionId ?? null,
     originUserId: message.originUserId ?? null,
+    traceId: message.traceId ?? null,
     seq: nextEvenSeq(db),
   });
 }

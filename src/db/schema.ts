@@ -195,9 +195,17 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- than falling back to agent-asserted identity. NULL on channel-side
   -- inbound (senderId embedded in content is authoritative) and on
   -- pre-migration rows.
-  origin_user_id TEXT
+  origin_user_id TEXT,
+  -- Per-turn trace identifier propagated through the dispatch chain.
+  -- Generated at the host channel ingress (uuid v4), copied verbatim
+  -- onto agent-to-agent inbound rows so a worker can attribute its
+  -- outbound back to the originating user request. The Langfuse sidecar
+  -- uses this when emitting trace observations; older rows without a
+  -- trace_id fall back to a synthetic frontlane-session_id trace.
+  trace_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
+CREATE INDEX IF NOT EXISTS idx_messages_in_trace ON messages_in(trace_id);
 
 -- Host tracks delivery outcomes for messages_out IDs.
 -- Avoids writing to outbound.db (container-owned).
@@ -247,8 +255,12 @@ CREATE TABLE IF NOT EXISTS messages_out (
   platform_id    TEXT,
   channel_type   TEXT,
   thread_id      TEXT,
-  content        TEXT NOT NULL
+  content        TEXT NOT NULL,
+  -- Copied from the inbound's trace_id by the agent runner so a
+  -- per-turn trace can stitch input → output across the dispatch tree.
+  trace_id       TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_messages_out_trace ON messages_out(trace_id);
 
 -- Container tracks processing status here instead of updating messages_in.
 -- Host reads this to know which messages have been processed.

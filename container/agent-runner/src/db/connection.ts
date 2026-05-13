@@ -119,6 +119,13 @@ export function getOutboundDb(): Database {
     if (!outCols.has('origin_user_id')) {
       _outbound.exec('ALTER TABLE messages_out ADD COLUMN origin_user_id TEXT');
     }
+    // Per-turn trace identifier propagated from messages_in. Older outbound
+    // DBs that pre-date Phase 3.3 don't have the column — the Langfuse
+    // sidecar falls back to synthetic trace ids when this is NULL.
+    if (!outCols.has('trace_id')) {
+      _outbound.exec('ALTER TABLE messages_out ADD COLUMN trace_id TEXT');
+      _outbound.exec('CREATE INDEX IF NOT EXISTS idx_messages_out_trace ON messages_out(trace_id)');
+    }
   }
   return _outbound;
 }
@@ -209,7 +216,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       thread_id        TEXT,
       content          TEXT NOT NULL,
       source_session_id TEXT,
-      origin_user_id   TEXT
+      origin_user_id   TEXT,
+      trace_id         TEXT
     );
     CREATE TABLE delivered (
       message_out_id      TEXT PRIMARY KEY,
@@ -242,7 +250,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       channel_type   TEXT,
       thread_id      TEXT,
       content        TEXT NOT NULL,
-      origin_user_id TEXT
+      origin_user_id TEXT,
+      trace_id       TEXT
     );
     CREATE TABLE processing_ack (
       message_id     TEXT PRIMARY KEY,

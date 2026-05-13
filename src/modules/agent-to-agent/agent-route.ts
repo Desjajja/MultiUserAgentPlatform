@@ -28,7 +28,13 @@ import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
-import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import {
+  openInboundDb,
+  openOutboundDb,
+  resolveSession,
+  sessionDir,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { hasDestination } from './db/agent-destinations.js';
 import { resolveOriginUserId } from './origin-user.js';
@@ -233,6 +239,26 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   }
   if (!originUserId) originUserId = session.owner_user_id ?? null;
 
+  // Carry the trace_id forward so the Langfuse sidecar can stitch the
+  // worker's spans onto the originating frontdesk trace. Look it up from
+  // the outbound row we're processing (host writes inbound -> container
+  // copies trace_id to outbound). NULL falls through to the sidecar's
+  // synthetic-trace-id fallback.
+  let traceId: string | null = null;
+  try {
+    const srcOut = openOutboundDb(session.agent_group_id, session.id);
+    try {
+      const row = srcOut.prepare('SELECT trace_id FROM messages_out WHERE id = ?').get(msg.id) as
+        | { trace_id: string | null }
+        | undefined;
+      traceId = row?.trace_id ?? null;
+    } finally {
+      srcOut.close();
+    }
+  } catch {
+    /* old outbound.db without trace_id column — fall back to NULL */
+  }
+
   writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
     kind: 'chat',
@@ -243,6 +269,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     content: forwardedContent,
     sourceSessionId: session.id,
     originUserId,
+    traceId,
   });
   log.info('Agent message routed', {
     from: session.agent_group_id,

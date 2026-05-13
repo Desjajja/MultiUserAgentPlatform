@@ -17,6 +17,8 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
+import { randomUUID } from 'crypto';
+
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -528,6 +530,11 @@ async function deliverToAgent(
     }
   }
 
+  // Per-turn trace id — generated once per channel ingress, then copied
+  // through every a2a hop so the Langfuse sidecar can stitch the entire
+  // dispatch chain into one trace tree.
+  const traceId = randomUUID();
+
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageIdForAgent(event.message.id, agent.agent_group_id),
     kind: event.message.kind,
@@ -537,6 +544,7 @@ async function deliverToAgent(
     threadId: deliveryAddr.threadId,
     content: event.message.content,
     trigger: wake ? 1 : 0,
+    traceId,
   });
 
   log.info('Message routed', {

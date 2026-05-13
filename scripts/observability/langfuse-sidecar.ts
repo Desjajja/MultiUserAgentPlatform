@@ -58,6 +58,7 @@ interface OutboundRow {
   kind: string;
   content: string;
   timestamp: string;
+  traceId: string | null;
 }
 
 interface InboundRow {
@@ -68,6 +69,7 @@ interface InboundRow {
   timestamp: string;
   sourceSessionId: string | null;
   originUserId: string | null;
+  traceId: string | null;
 }
 
 interface Cursor {
@@ -104,19 +106,35 @@ function listActiveSessions(): SessionInfo[] {
 function readNewOutbound(session: SessionInfo, sinceSeq: number): OutboundRow[] {
   const db = path.join(SESSIONS_ROOT, session.agentGroupId, session.id, 'outbound.db');
   if (!fs.existsSync(db)) return [];
+  // trace_id was added in Phase 3.3; older DBs may not have it. COALESCE
+  // through an empty string so the column shape is stable for parsing.
   try {
-    const sql = `SELECT seq, id, kind, content, timestamp FROM messages_out WHERE seq > ${sinceSeq} ORDER BY seq;`;
+    const sql = `SELECT seq, id, kind, content, timestamp, COALESCE(trace_id, '') FROM messages_out WHERE seq > ${sinceSeq} ORDER BY seq;`;
     const out = execSync(`sqlite3 -separator $'\\t' "${db}" "${sql}"`, { encoding: 'utf8' }).trim();
     if (!out) return [];
     return out
       .split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [seq, id, kind, content, timestamp] = line.split('\t');
-        return { seq: Number(seq), id, kind, content, timestamp };
+        const [seq, id, kind, content, timestamp, traceId] = line.split('\t');
+        return { seq: Number(seq), id, kind, content, timestamp, traceId: traceId || null };
       });
   } catch {
-    return [];
+    // Schema older than trace_id rollout — re-try without the column.
+    try {
+      const sql = `SELECT seq, id, kind, content, timestamp FROM messages_out WHERE seq > ${sinceSeq} ORDER BY seq;`;
+      const out = execSync(`sqlite3 -separator $'\\t' "${db}" "${sql}"`, { encoding: 'utf8' }).trim();
+      if (!out) return [];
+      return out
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const [seq, id, kind, content, timestamp] = line.split('\t');
+          return { seq: Number(seq), id, kind, content, timestamp, traceId: null };
+        });
+    } catch {
+      return [];
+    }
   }
 }
 
@@ -124,14 +142,14 @@ function readNewInbound(session: SessionInfo, sinceSeq: number): InboundRow[] {
   const db = path.join(SESSIONS_ROOT, session.agentGroupId, session.id, 'inbound.db');
   if (!fs.existsSync(db)) return [];
   try {
-    const sql = `SELECT seq, id, kind, content, timestamp, COALESCE(source_session_id, ''), COALESCE(origin_user_id, '') FROM messages_in WHERE seq > ${sinceSeq} ORDER BY seq;`;
+    const sql = `SELECT seq, id, kind, content, timestamp, COALESCE(source_session_id, ''), COALESCE(origin_user_id, ''), COALESCE(trace_id, '') FROM messages_in WHERE seq > ${sinceSeq} ORDER BY seq;`;
     const out = execSync(`sqlite3 -separator $'\\t' "${db}" "${sql}"`, { encoding: 'utf8' }).trim();
     if (!out) return [];
     return out
       .split('\n')
       .filter(Boolean)
       .map((line) => {
-        const [seq, id, kind, content, timestamp, sourceSessionId, originUserId] = line.split('\t');
+        const [seq, id, kind, content, timestamp, sourceSessionId, originUserId, traceId] = line.split('\t');
         return {
           seq: Number(seq),
           id,
@@ -140,10 +158,34 @@ function readNewInbound(session: SessionInfo, sinceSeq: number): InboundRow[] {
           timestamp,
           sourceSessionId: sourceSessionId || null,
           originUserId: originUserId || null,
+          traceId: traceId || null,
         };
       });
   } catch {
-    return [];
+    // Schema older than trace_id rollout — re-try without it.
+    try {
+      const sql = `SELECT seq, id, kind, content, timestamp, COALESCE(source_session_id, ''), COALESCE(origin_user_id, '') FROM messages_in WHERE seq > ${sinceSeq} ORDER BY seq;`;
+      const out = execSync(`sqlite3 -separator $'\\t' "${db}" "${sql}"`, { encoding: 'utf8' }).trim();
+      if (!out) return [];
+      return out
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const [seq, id, kind, content, timestamp, sourceSessionId, originUserId] = line.split('\t');
+          return {
+            seq: Number(seq),
+            id,
+            kind,
+            content,
+            timestamp,
+            sourceSessionId: sourceSessionId || null,
+            originUserId: originUserId || null,
+            traceId: null,
+          };
+        });
+    } catch {
+      return [];
+    }
   }
 }
 
@@ -261,7 +303,12 @@ async function tick(): Promise<void> {
       });
     }
 
-    // New inbound (user → agent or frontdesk → worker) messages
+    // New inbound (user → agent or frontdesk → worker) messages.
+    // Phase 3.3: if the row carries a real trace_id, surface it on the span
+    // metadata so Langfuse search-by-trace_id works. The trace itself stays
+    // pinned to the synthetic per-session id (no breaking change to the
+    // existing trace structure); the metadata.trace_id is the cross-session
+    // join key for analytics.
     for (const m of inb) {
       const linkBack = m.sourceSessionId && m.sourceSessionId !== sess.id;
       items.push({
@@ -280,6 +327,7 @@ async function tick(): Promise<void> {
             direction: 'inbound',
             source_session_id: m.sourceSessionId,
             origin_user_id: m.originUserId,
+            trace_id: m.traceId,
           },
         },
       });
@@ -320,6 +368,7 @@ async function tick(): Promise<void> {
               transport: usage.transport ?? null,
               duration_ms: usage.durationMs ?? null,
               seq: m.seq,
+              trace_id: m.traceId,
             },
           },
         });
@@ -334,7 +383,7 @@ async function tick(): Promise<void> {
             name: `outbound: ${m.kind}`,
             startTime: toIso(m.timestamp, now),
             output: summarize(m.content),
-            metadata: { kind: m.kind, seq: m.seq, direction: 'outbound' },
+            metadata: { kind: m.kind, seq: m.seq, direction: 'outbound', trace_id: m.traceId },
           },
         });
       }

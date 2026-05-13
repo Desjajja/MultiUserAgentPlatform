@@ -267,6 +267,12 @@ export function writeSessionMessage(
      * NULL on channel-side inbound (senderId already embedded in content).
      */
     originUserId?: string | null;
+    /**
+     * Per-turn trace identifier. Channel-side ingress generates a uuid v4;
+     * a2a hops copy the source inbound's trace_id so the dispatch chain
+     * shares one trace. Sidecar uses this to stitch the Langfuse view.
+     */
+    traceId?: string | null;
   },
 ): void {
   // Extract base64 attachment data, save to inbox, replace with file paths
@@ -287,6 +293,7 @@ export function writeSessionMessage(
       trigger: message.trigger ?? 1,
       sourceSessionId: message.sourceSessionId ?? null,
       originUserId: message.originUserId ?? null,
+      traceId: message.traceId ?? null,
     });
   } finally {
     db.close();
