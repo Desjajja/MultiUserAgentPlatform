@@ -104,15 +104,28 @@ export interface RoutingContext {
 
 /**
  * Extract routing context from a batch of messages.
- * Uses the first message's routing fields.
+ *
+ * Picks the FIRST chat-kind row for routing. Non-chat rows (task,
+ * webhook, system, scheduled reminders) have no user-facing routing
+ * surface — their platform_id/thread_id may be null, stale, or a
+ * scheduling sentinel. A pre-v23 bug was taking `messages[0]`
+ * unconditionally, which meant a batch that started with a due task
+ * would produce null/stale routing for the actual user chat that came
+ * after it — tool calls and error-fallback writeMessageOut ended up
+ * stamped with the task's (often null) thread.
+ *
+ * Falls back to the head-of-batch only when no chat row is present
+ * (pure task/webhook batches), matching the pre-v23 shape for those
+ * cases. Today those batches produce no user-facing outbound anyway,
+ * so the fallback is mostly defensive.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
-  const first = messages[0];
+  const anchor = messages.find((m) => m.kind === 'chat' || m.kind === 'chat-sdk') ?? messages[0];
   return {
-    platformId: first?.platform_id ?? null,
-    channelType: first?.channel_type ?? null,
-    threadId: first?.thread_id ?? null,
-    inReplyTo: first?.id ?? null,
+    platformId: anchor?.platform_id ?? null,
+    channelType: anchor?.channel_type ?? null,
+    threadId: anchor?.thread_id ?? null,
+    inReplyTo: anchor?.id ?? null,
   };
 }
 

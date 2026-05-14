@@ -234,7 +234,35 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
 
-    const routing = extractRouting(messages);
+    // Batch-split FIRST — before /clear handling and before routing
+    // extraction. Two reasons:
+    //
+    //   1. /clear handling used to run against pre-split `messages`
+    //      with pre-split `routing`. If Bob's /clear landed in the same
+    //      tick as Alice's trigger message (or vice versa), the "Session
+    //      cleared." ack would be stamped with the wrong anchor's thread
+    //      / in_reply_to.
+    //   2. extractRouting on the pre-split batch can inherit routing
+    //      from a deferred row (accumulated context from a different
+    //      user), so every downstream routing consumer read the wrong
+    //      thread.
+    //
+    // Splitting early means both /clear and extractRouting see only the
+    // rows that belong to this turn's anchor identity.
+    const split = splitBatchByTurn(messages);
+    if (split.defer.length > 0) {
+      releaseProcessing(split.defer.map((m) => m.id));
+      log(
+        `Batch split: kept ${split.keep.length} row(s) for this turn, deferred ${split.defer.length} from different user/thread`,
+      );
+    }
+    const turnMessages = split.keep;
+    if (turnMessages.length === 0) {
+      log('Batch split left nothing in the anchor group, looping');
+      continue;
+    }
+
+    const turnRouting = extractRouting(turnMessages);
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
@@ -242,7 +270,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
-    for (const msg of messages) {
+    for (const msg of turnMessages) {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
@@ -250,9 +278,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
+          platform_id: turnRouting.platformId,
+          channel_type: turnRouting.channelType,
+          thread_id: turnRouting.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
         });
         commandIds.push(msg.id);
@@ -266,9 +294,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (normalMessages.length === 0) {
-      const remainingIds = ids.filter((id) => !commandIds.includes(id));
+      const remainingIds = turnMessages.map((m) => m.id).filter((id) => !commandIds.includes(id));
       if (remainingIds.length > 0) markCompleted(remainingIds);
-      log(`All ${messages.length} message(s) were commands, skipping query`);
+      log(`All ${turnMessages.length} message(s) in this turn were commands, skipping query`);
       continue;
     }
 
@@ -295,34 +323,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Batch-split: if getPendingMessages happened to pick up messages
-    // from multiple users / threads in the same poll tick, only process
-    // the anchor group this turn. The rest go back to pending so a
-    // fresh turn picks them up with the right identity pinned. Without
-    // this, anchor-only resolveBatchIdentity would stamp the whole mixed
-    // batch with the first user's attribution — classic
-    // group/shared-session cross-contamination.
-    const split = splitBatchByTurn(keep);
-    if (split.defer.length > 0) {
-      releaseProcessing(split.defer.map((m) => m.id));
-      log(
-        `Batch split: kept ${split.keep.length} row(s) for this turn, deferred ${split.defer.length} from different user/thread`,
-      );
-    }
-    keep = split.keep;
-    if (keep.length === 0) {
-      log('Batch split left nothing in the anchor group, looping');
-      continue;
-    }
-
-    // Recompute routing against the post-split batch. The pre-split
-    // routing was derived from `messages`, which may have included the
-    // deferred rows — if the oldest was a Bob message and we deferred
-    // it, we still would have used Bob's thread / in_reply_to for
-    // this turn's tool calls and error fallbacks. Keep routing pinned
-    // to what this turn actually contains.
-    const turnRouting = extractRouting(keep);
-
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
@@ -336,12 +336,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
-    // Process the query while concurrently polling for new messages
+    // Process the query while concurrently polling for new messages.
+    // turnMessages already excludes the deferred rows (split happened
+    // up-front), so we just filter out the turn's own /clear commands
+    // and any rows the pre-task script gated.
     const skippedSet = new Set(skipped);
-    const deferredSet = new Set(split.defer.map((m) => m.id));
-    const processingIds = ids.filter(
-      (id) => !commandIds.includes(id) && !skippedSet.has(id) && !deferredSet.has(id),
-    );
+    const commandSet = new Set(commandIds);
+    const processingIds = turnMessages
+      .map((m) => m.id)
+      .filter((id) => !commandSet.has(id) && !skippedSet.has(id));
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     // Use turnRouting (post-split) so deferred messages don't leak their
@@ -409,7 +412,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    log(`Completed ${turnMessages.length} message(s) this turn (${ids.length} claimed at tick start)`);
   }
 }
 

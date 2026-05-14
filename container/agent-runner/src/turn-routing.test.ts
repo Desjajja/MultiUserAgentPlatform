@@ -73,4 +73,83 @@ describe('turn routing after batch split', () => {
     const post = extractRouting(keep);
     expect(post).toEqual(pre);
   });
+
+  it('skips a leading non-chat row (task / webhook / system) and anchors on the chat row', () => {
+    // Scenario from the latest review: a due task fires in the same
+    // poll tick as Alice's chat message. splitBatchByTurn keeps the
+    // task with the anchor (non-chat rows ride along), so keep[0] is
+    // the task — its platform_id may be null or a scheduling sentinel.
+    // extractRouting must skip it and anchor on Alice's chat row.
+    const dueTask = row({
+      id: 't-1',
+      kind: 'task',
+      // Tasks may have null routing (e.g. scheduled-by-self reminders)
+      // or stale routing left over from when they were created.
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      content: '{}',
+    });
+    const aliceChat = row({
+      id: 'alice-1',
+      kind: 'chat',
+      platform_id: 'feishu:p2p:ou_alice',
+      thread_id: 'alice-thread',
+    });
+
+    const routing = extractRouting([dueTask, aliceChat]);
+    expect(routing.platformId).toBe('feishu:p2p:ou_alice');
+    expect(routing.threadId).toBe('alice-thread');
+    expect(routing.inReplyTo).toBe('alice-1');
+  });
+
+  it('falls back to head-of-batch when there is no chat row at all', () => {
+    // Pure task batch (e.g. a recurrence fired with no concurrent user
+    // chat). Routing comes from the task itself; in practice these
+    // batches don't produce user-facing outbound, so the value is
+    // mostly defensive.
+    const taskOnly = row({
+      id: 't-only',
+      kind: 'task',
+      platform_id: 'feishu:p2p:ou_alice',
+      thread_id: null,
+      content: '{}',
+    });
+    const routing = extractRouting([taskOnly]);
+    expect(routing.platformId).toBe('feishu:p2p:ou_alice');
+    expect(routing.inReplyTo).toBe('t-only');
+  });
+
+  it("/clear ack uses turn-anchor routing, not pre-split batch[0]", () => {
+    // Bob /clear arrives in the same tick as an older Alice
+    // accumulated message. Pre-split batch[0] is Alice. With the fix
+    // (split happens before /clear handling), Bob's /clear is the
+    // anchor of his own turn and the ack lands in Bob's thread, not
+    // Alice's.
+    const aliceAccum = row({
+      id: 'alice-1',
+      trigger: 0,
+      content: JSON.stringify({ senderId: 'feishu:ou_alice', text: 'thinking aloud' }),
+      platform_id: 'feishu:p2p:ou_alice',
+      thread_id: 'alice-thread',
+    });
+    const bobClear = row({
+      id: 'bob-clear',
+      trigger: 1,
+      content: JSON.stringify({ senderId: 'feishu:ou_bob', text: '/clear' }),
+      platform_id: 'feishu:p2p:ou_bob',
+      thread_id: 'bob-thread',
+    });
+
+    const split = splitBatchByTurn([aliceAccum, bobClear]);
+    // Anchor is Bob (his row is trigger=1), so Alice's accumulated row
+    // gets deferred and the /clear runs against Bob's surface only.
+    expect(split.keep.map((m) => m.id)).toEqual(['bob-clear']);
+    expect(split.defer.map((m) => m.id)).toEqual(['alice-1']);
+
+    const turnRouting = extractRouting(split.keep);
+    expect(turnRouting.platformId).toBe('feishu:p2p:ou_bob');
+    expect(turnRouting.threadId).toBe('bob-thread');
+    expect(turnRouting.inReplyTo).toBe('bob-clear');
+  });
 });
