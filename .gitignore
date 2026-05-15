@@ -10,10 +10,24 @@ coverage/
 .env.*.local
 
 data/
-groups/
 logs/
 
+# Worker topology: source config is tracked (container.json / CLAUDE.local.md /
+# AGENTS.md). Spawn-time generated artifacts are not — .claude-fragments/ is
+# composed per-spawn, CLAUDE.md is the generated @import list, and
+# .claude-shared.md is a container-path symlink that is broken on the host.
+groups/*/.claude-fragments/
+groups/*/.claude-shared.md
+groups/*/CLAUDE.md
+# Worker runtime artifacts (camera frames, skill scratch output).
+groups/**/*.jpg
+groups/**/*.jpeg
+groups/**/*.png
+
 container/agent-runner/node_modules/
+
+# Perf benchmark raw output — local-only clutter, not source.
+perf-results-raw*.json
 
 *.sqlite
 *.db

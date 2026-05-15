@@ -9,7 +9,7 @@ The provided guide states:
 - broker host is `x2219abf.ala.cn-hangzhou.emqxsl.cn`
 - broker port is `8883`
 - username is `emqx`
-- publisher client id must be unique (example: `openclaw_pub_001`)
+- publisher client id must be unique (example: `frontlane_chassis_pub_001`)
 - do not reuse receiver client id `rdk_subscriber`
 
 ## Topic clarification

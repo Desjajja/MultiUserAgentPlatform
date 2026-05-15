@@ -1,0 +1,29 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [
+      "python3",
+      "python3-requests"
+    ],
+    "npm": []
+  },
+  "imageTag": "frontlane-agent-v2-aa698fd5:ag-1778660838-knowwk",
+  "additionalMounts": [],
+  "skills": [
+    "arxiv",
+    "semantic-scholar",
+    "websearch",
+    "rag-upload",
+    "remote-rag-expert"
+  ],
+  "provider": "openai",
+  "groupName": "FrontLane Knowledge Worker",
+  "assistantName": "FrontLane Knowledge Worker",
+  "a2aSessionMode": "root-session",
+  "agentGroupId": "ag-1778660838-knowwk",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  }
+}

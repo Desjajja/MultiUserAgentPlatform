@@ -1,0 +1,16 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [],
+    "npm": []
+  },
+  "additionalMounts": [],
+  "skills": ["lark-base", "lark-sheets", "lark-openapi-explorer", "delivery-team"],
+  "a2aSessionMode": "root-session",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  },
+  "provider": "openai"
+}

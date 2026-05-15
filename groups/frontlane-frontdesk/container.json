@@ -1,0 +1,19 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [],
+    "npm": []
+  },
+  "additionalMounts": [],
+  "skills": "all",
+  "provider": "openai",
+  "groupName": "FrontLane Desk",
+  "assistantName": "FrontLane Desk",
+  "a2aSessionMode": "root-session",
+  "agentGroupId": "ag-1778488029905-vpov75",
+  "resources": {
+    "memoryMb": 768,
+    "cpus": 1,
+    "pidsLimit": 384
+  }
+}

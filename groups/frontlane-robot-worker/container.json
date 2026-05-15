@@ -1,0 +1,16 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [],
+    "npm": []
+  },
+  "additionalMounts": [],
+  "skills": ["chassis-move", "mqtt-experiment-mode", "orbbec-tracking-control", "remote-liquid-exec", "robot-gimbal", "robot-hand", "robot-pipette"],
+  "a2aSessionMode": "root-session",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  },
+  "provider": "openai"
+}

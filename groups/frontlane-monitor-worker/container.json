@@ -1,0 +1,31 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [
+      "python3",
+      "python3-requests"
+    ],
+    "npm": []
+  },
+  "imageTag": "frontlane-agent-v2-aa698fd5:ag-1778662219-monwk",
+  "additionalMounts": [],
+  "skills": [
+    "image-fetch",
+    "lab-monitor",
+    "ppe-alert",
+    "ppe-recheck"
+  ],
+  "provider": "openai",
+  "groupName": "FrontLane Monitor Worker",
+  "assistantName": "FrontLane Monitor Worker",
+  "a2aSessionMode": "root-session",
+  "agentGroupId": "ag-1778662219-monwk",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  },
+  "env": {
+    "CAMERA_BASE_URL": "http://host.docker.internal:18001"
+  }
+}

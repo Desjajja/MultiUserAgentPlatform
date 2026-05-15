@@ -30,7 +30,7 @@ Use this skill for **semantic navigation of the chassis robot**.
 - Username: `emqx`
 - Password (per guide): `12345678`
 - Topic: `semantic_nav`
-- Client ID: use a **unique publisher ID** such as `openclaw_pub_001`; do **not** reuse `rdk_subscriber`
+- Client ID: use a **unique publisher ID** such as `frontlane_chassis_pub_001`; do **not** reuse `rdk_subscriber`
 
 If these credentials change, update the bundled script before execution.
 

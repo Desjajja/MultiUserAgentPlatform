@@ -12,3 +12,4 @@
 import './cli.js';
 import './feishu.js';
 import './mqtt.js';
+import './ppe-webhook.js';

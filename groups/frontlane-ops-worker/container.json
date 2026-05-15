@@ -1,0 +1,19 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [],
+    "npm": []
+  },
+  "additionalMounts": [],
+  "skills": "all",
+  "provider": "openai",
+  "groupName": "FrontLane Ops Worker",
+  "assistantName": "FrontLane Ops Worker",
+  "a2aSessionMode": "root-session",
+  "agentGroupId": "ag-1778488029917-oh892t",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  }
+}

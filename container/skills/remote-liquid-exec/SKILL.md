@@ -31,13 +31,12 @@ description: Execute remote pipetting (移液/取样/吸液/排液/换枪头) on
 **立刻执行**（不要再问参数表，不要再等确认）：
 
 ```
-python3 /Users/realityloop/.openclaw/workspace-exec-robot/skills/remote-liquid-exec/scripts/remote_liquid_exec.py start --task-count 4
+python3 {baseDir}/scripts/remote_liquid_exec.py start --task-count 4
 ```
 
 > ⚠️ **路径铁律（exec preflight 强约束）**：
-> - **必须**用上面这个 **绝对路径**调脚本。`{baseDir}` 不会自动展开成你期望的目录。
-> - **严禁** `cd <dir> && python3 ...` —— OpenClaw exec preflight 拒所有 shell-compound（`&&` / `;` / `|` / `$(…)` / 重定向 / env 前缀），违反会直接报 `exec preflight: complex interpreter invocation detected`。
-> - 脚本实际位置：`/Users/realityloop/.openclaw/workspace-exec-robot/skills/remote-liquid-exec/scripts/remote_liquid_exec.py`（exec-robot 上下文）。
+> - **必须**用 `{baseDir}` 占位符，FrontLane exec 在调用时会展开成 container 内的绝对路径（通常为 `/workspace/agent/skills/remote-liquid-exec`）。**不要**自己拼写 `/Users/...` 这类 host 路径，container 内访问不到。
+> - **严禁** `cd <dir> && python3 ...` —— FrontLane exec preflight 拒所有 shell-compound（`&&` / `;` / `|` / `$(…)` / 重定向 / env 前缀），违反会直接报 `exec preflight: complex interpreter invocation detected`。
 
 参数全部用默认值：`task_count=4`，`skip_home_before_vision=true`，`no_show=true`。
 
@@ -71,7 +70,7 @@ python3 /Users/realityloop/.openclaw/workspace-exec-robot/skills/remote-liquid-e
 python3 {baseDir}/scripts/remote_liquid_exec.py start --task-count <N> --params-json {"pipette_x_offset_mm":-25,"pipette_y_offset_mm":-10,"pipette_plan_association_mm":170}
 ```
 
-> JSON 作为单个参数原样传给 `--params-json`，**不要**在 exec 里加 shell 引号 —— openclaw exec 预检拒绝 shell quoting。把 JSON 串放进 args 列表的一个元素即可。
+> JSON 作为单个参数原样传给 `--params-json`，**不要**在 exec 里加 shell 引号 —— FrontLane exec 预检拒绝 shell quoting。把 JSON 串放进 args 列表的一个元素即可。
 
 ## 调用接口（subcommand）
 

@@ -1,4 +1,3 @@
-# 文件路径: /home/chris/.openclaw/workspace/skills/experiment_archive/bridge.py
 import requests
 import json
 import os

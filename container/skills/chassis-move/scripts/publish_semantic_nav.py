@@ -18,7 +18,7 @@ PORT = 8883
 USERNAME = os.environ.get("EMQX_USERNAME", "emqx")
 PASSWORD = os.environ.get("EMQX_PASSWORD", "")
 TOPIC = "semantic_nav"
-CLIENT_ID = f"openclaw_pub_{socket.gethostname()}_{os.getpid()}"
+CLIENT_ID = f"frontlane_chassis_pub_{socket.gethostname()}_{os.getpid()}"
 
 
 def main() -> int:

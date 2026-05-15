@@ -1,0 +1,30 @@
+{
+  "mcpServers": {},
+  "packages": {
+    "apt": [],
+    "npm": []
+  },
+  "additionalMounts": [],
+  "skills": [
+    "lark-im",
+    "lark-mail",
+    "lark-task",
+    "lark-calendar",
+    "lark-event",
+    "lark-contact",
+    "lark-vc",
+    "lark-minutes",
+    "lark-skill-maker",
+    "lark-shared"
+  ],
+  "provider": "openai",
+  "groupName": "FrontLane Feishu Comm Worker",
+  "assistantName": "FrontLane Feishu Comm Worker",
+  "a2aSessionMode": "root-session",
+  "agentGroupId": "ag-1778662351-feishucomm",
+  "resources": {
+    "memoryMb": 1024,
+    "cpus": 1,
+    "pidsLimit": 512
+  }
+}
