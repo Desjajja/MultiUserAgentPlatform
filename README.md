@@ -1,5 +1,11 @@
 # FrontLane Agent Platform
 
+> **🧭 给 coding agent 的入场指引**：
+> - 本项目正在执行 V1（openclaw / "小环"）→ MUAP 迁移。当前是 v1.2 宪法已拍板、Phase 0a + Phase 0b 待启动状态。
+> - **接手开发前必读**：[`docs/migration-from-v1.md`](docs/migration-from-v1.md) → 指向姊妹仓 `../openclaw/CLOSEOUT/migration-to-muap.md` v1.2（迁移核心宪法，Q1-Q7 全部决议）。
+> - **架构决策档案**：[`docs/decisions/README.md`](docs/decisions/README.md)（ADR 索引；找"为什么这么做"的入口）。
+> - **续接 / 留痕规则**：见根 [`CLAUDE.md`](CLAUDE.md) §"续接指南" 与 `.sisyphus/` 工作痕迹。
+
 一个面向企业飞书入口、多人隔离上下文、ERP 派活协同的多用户 Agent 基础设施。
 
 当前代码的目标不是“个人 AI 助手”，而是做一层企业入口 Agent 平台：
@@ -291,6 +297,8 @@ FEISHU_EVENT_MODE=hybrid
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — 开发者上手指南
 - [docs/ERP-INTEGRATION-GUIDE.md](docs/ERP-INTEGRATION-GUIDE.md) — ERP 后端集成教程
 - [docs/architecture.md](docs/architecture.md)
+- **[docs/migration-from-v1.md](docs/migration-from-v1.md)** — V1（openclaw）迁移导航（必读，外部 coding agent 第一入口）
+- **[docs/decisions/README.md](docs/decisions/README.md)** — 架构决策档案（ADR 索引）
 - [docs/enterprise-multi-user.md](docs/enterprise-multi-user.md)
 - [docs/enterprise-erp-gateway.md](docs/enterprise-erp-gateway.md)
 - [docs/isolation-model.md](docs/isolation-model.md)

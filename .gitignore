@@ -21,3 +21,6 @@ container/agent-runner/node_modules/
 *.db-wal
 *.pid
 
+# Agent working state (advisory, not authoritative — see CLAUDE.md §Session Continuation Guide)
+.sisyphus/
+
