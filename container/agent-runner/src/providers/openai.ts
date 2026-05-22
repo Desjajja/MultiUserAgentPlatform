@@ -53,6 +53,11 @@ interface OpenAIUsage {
   // we normalize at extraction time.
   prompt_tokens?: number;
   completion_tokens?: number;
+  // OpenAI prefix cache hit count (chat-completions standard).
+  // Surfaces as `prompt_tokens_details.cached_tokens` in the API response.
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
 }
 
 interface OpenAIResponse {
@@ -810,6 +815,7 @@ export class OpenAIProvider implements AgentProvider {
             }
             let totalInput = 0;
             let totalOutput = 0;
+            let totalCached = 0;
             let modelName: string | undefined;
             let transport: string | undefined;
             for (const u of turn.usages) {
@@ -824,6 +830,7 @@ export class OpenAIProvider implements AgentProvider {
               };
               totalInput += u.inputTokens ?? 0;
               totalOutput += u.outputTokens ?? 0;
+              totalCached += u.cachedTokens ?? 0;
               modelName = u.model;
               transport = u.transport;
             }
@@ -836,6 +843,8 @@ export class OpenAIProvider implements AgentProvider {
                   'llm.token_count.prompt': totalInput,
                   'llm.token_count.completion': totalOutput,
                   'llm.token_count.total': totalInput + totalOutput,
+                  cached_tokens: totalCached,
+                  cache_hit_rate: totalInput > 0 ? totalCached / totalInput : 0,
                   'output.value': truncate(turn.text ?? ''),
                   // Internal / legacy compatibility
                   model: modelName,
@@ -912,6 +921,8 @@ export class OpenAIProvider implements AgentProvider {
       inputTokens?: number;
       outputTokens?: number;
       totalTokens?: number;
+      /** OpenAI prefix cache hit count (subset of inputTokens). */
+      cachedTokens?: number;
       durationMs?: number;
       transport: OpenAITransport;
     }>;
@@ -927,6 +938,8 @@ export class OpenAIProvider implements AgentProvider {
       inputTokens?: number;
       outputTokens?: number;
       totalTokens?: number;
+      /** OpenAI prefix cache hit count (subset of inputTokens). */
+      cachedTokens?: number;
       durationMs?: number;
       transport: OpenAITransport;
     }> = [];
@@ -1002,6 +1015,7 @@ export class OpenAIProvider implements AgentProvider {
           inputTokens: u.input_tokens ?? u.prompt_tokens,
           outputTokens: u.output_tokens ?? u.completion_tokens,
           totalTokens: u.total_tokens,
+          cachedTokens: u.prompt_tokens_details?.cached_tokens,
           durationMs: Date.now() - callStartedAt,
           transport,
         });
