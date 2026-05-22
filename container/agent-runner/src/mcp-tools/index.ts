@@ -12,6 +12,7 @@ import './agents.js';
 import './self-mod.js';
 import './erp-gateway.js';
 import './classify-intent.js';
+import './skill-loader.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
