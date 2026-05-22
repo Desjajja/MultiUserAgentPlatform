@@ -122,6 +122,30 @@ export interface ContainerConfig {
    * by this map.
    */
   env?: Record<string, string>;
+  /**
+   * Progressive skill disclosure (perf). Replaces each skill's full
+   * `instructions.md` content in the composed system prompt to keep the
+   * prompt small and prefix-cache friendly.
+   *
+   *   false (default)  — current behavior: every skill's instructions.md
+   *                      is inlined into the system prompt.
+   *   true             — emit a compact `Available Skills` index
+   *                      (name + description from SKILL.md frontmatter) +
+   *                      anti-overthink preamble telling the agent to
+   *                      skip `load_skill` for simple greetings. Use
+   *                      `load_skill(name)` MCP tool to fetch a skill on
+   *                      demand.
+   *   "lean"           — omit the skill index entirely. For dispatcher
+   *                      agents that route to worker agents and never
+   *                      need to execute skills themselves
+   *                      (`frontlane-frontdesk` pattern). The
+   *                      `load_skill` tool stays registered but the
+   *                      agent has no list to choose from.
+   *
+   * Worker agent groups that already specify a narrow `skills` array
+   * usually leave this off — their prompt is already small.
+   */
+  progressiveDisclosure?: boolean | 'lean';
 }
 
 function emptyConfig(): ContainerConfig {
@@ -192,6 +216,10 @@ export function readContainerConfig(folder: string): ContainerConfig {
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
       resources: normalizeResources(raw.resources),
       env: raw.env,
+      progressiveDisclosure:
+        raw.progressiveDisclosure === 'lean'
+          ? 'lean'
+          : raw.progressiveDisclosure === true,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
