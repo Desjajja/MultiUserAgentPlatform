@@ -238,6 +238,20 @@ async function drainSession(session: Session): Promise<void> {
   }
 }
 
+/**
+ * Strip model reasoning tags from user-facing text. Some providers (notably
+ * MiniMax over the chat-completions transport) inline `<think>…</think>`
+ * reasoning into the message body; without this it leaks verbatim into the
+ * channel. Paired blocks are removed; stray unmatched tags are also dropped
+ * as a fallback. Non-think content is never touched.
+ */
+function stripThinkTags(text: string): string {
+  return text
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
+    .replace(/<\/?think(?:ing)?>/gi, '')
+    .trim();
+}
+
 async function deliverMessage(
   msg: {
     id: string;
@@ -395,12 +409,23 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
+  // Defense-in-depth: scrub model reasoning tags from the user-facing text
+  // before it reaches any channel. The agent prompt also forbids them, but a
+  // misbehaving model shouldn't be able to leak `<think>` blobs to users.
+  let outboundContent = msg.content;
+  if (content && typeof content === 'object' && typeof content.text === 'string') {
+    const cleaned = stripThinkTags(content.text);
+    if (cleaned !== content.text) {
+      outboundContent = JSON.stringify({ ...content, text: cleaned });
+    }
+  }
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
     msg.thread_id,
     msg.kind,
-    msg.content,
+    outboundContent,
     files,
   );
   log.info('Message delivered', {
