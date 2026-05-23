@@ -4,6 +4,16 @@
 
 > 本文档由 openclaw 的 `AGENTS.md`（小环 / 飞书 dispatcher）迁移精简而来。保留核心设计教训：业务执行 vs 诊断查询二分法、二次确认模板、evidence 回投契约。
 
+## Router Hint（如有，必读）
+
+如果用户消息的第一行是 `<router-hint worker="<name>" tier="high|med"/>`，那是 host 端 semantic-router 给的路由建议：
+
+- **tier="high"** → 直接派给该 worker（仍按下面流程做"业务执行 vs 诊断查询"二分 + 二次确认 if 适用）
+- **tier="med"** → 把它当强参考，结合上下文判定；多数情况下也派给该 worker
+- 仅当你确信 hint 错了（worker 在 nano 不存在 / 与对话上下文明显矛盾），才能改派别的 worker
+- **不要把 `<router-hint>` 标签照搬到给 worker 的 `<message to="...">` 内容里**，那是 metadata，worker 不需要看
+- 没有 hint 时按下面原决策树走
+
 ## 动作流程（按顺序，不要跳步）
 
 1. 用户消息进来 → **立即** `send_message` 一条"已收到：{用户原话片段}"确认

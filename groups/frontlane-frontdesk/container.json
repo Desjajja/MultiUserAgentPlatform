@@ -15,5 +15,6 @@
     "memoryMb": 768,
     "cpus": 1,
     "pidsLimit": 384
-  }
+  },
+  "progressiveDisclosure": true
 }

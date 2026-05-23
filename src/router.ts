@@ -38,6 +38,7 @@ import { traceEventBus } from './observability/event-bus.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getDeliveryAdapter } from './delivery.js';
+import { tryRoute, buildHintTag } from './semantic-router-client.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
@@ -536,6 +537,100 @@ async function deliverToAgent(
   // dispatch chain into one trace tree.
   const traceId = randomUUID();
 
+  // Semantic-router decision (Phase 1: Hint mode + Phase E: Short-Circuit).
+  //
+  // Only the dispatcher (frontdesk-style) agent group benefits — workers
+  // already have a narrow whitelist and don't need pre-routing. We detect
+  // this by folder name; future: make it a container.json field if more
+  // dispatchers appear.
+  //
+  // tryRoute returns one of:
+  //   - {kind:'short_circuit'} → host writes a fixed reply directly to
+  //     outbound.db; frontdesk LLM is NOT invoked (Phase E)
+  //   - {kind:'hint'}          → prepend `<router-hint worker="..."/>` to
+  //     user text; frontdesk LLM still runs but routes faster
+  //   - null                   → original flow
+  //
+  // Phase E feature flag: NANO_SHORT_CIRCUIT_ENABLED (default true). Set to
+  // anything other than 'true' to disable short-circuit and fall back to
+  // hint-only behavior.
+  let messageContent = event.message.content;
+  let shortCircuited = false;
+  if (agentGroup.folder === 'frontlane-frontdesk' && event.message.kind === 'chat') {
+    try {
+      const parsed = safeParseContent(event.message.content);
+      const userText = parsed.text ?? '';
+      if (userText.trim().length > 0) {
+        const decision = await tryRoute(userText);
+
+        if (decision?.kind === 'short_circuit') {
+          const shortCircuitEnabled =
+            (process.env.NANO_SHORT_CIRCUIT_ENABLED ?? 'true').toLowerCase() === 'true';
+          if (shortCircuitEnabled) {
+            // Try to write the fixed reply directly to outbound.db. The
+            // container is the normal sole writer; this competes for the
+            // SQLite write lock. writeOutboundDirect returns false on
+            // SQLITE_BUSY (or any write failure) — we fall through to the
+            // regular LLM path instead of dropping the user message.
+            const ok = writeOutboundDirect(session.agent_group_id, session.id, {
+              id: `sc-${traceId}`,
+              kind: 'chat',
+              platformId: deliveryAddr.platformId,
+              channelType: deliveryAddr.channelType,
+              threadId: deliveryAddr.threadId,
+              content: JSON.stringify({ text: decision.replyText }),
+              inReplyTo: event.message.id,
+            });
+            if (ok) {
+              log.info('semantic-router short-circuit', {
+                intent: decision.intent,
+                conf: decision.rawConfidence.toFixed(3),
+                traceId,
+                replyLen: decision.replyText.length,
+              });
+              shortCircuited = true;
+            } else {
+              // Lock contention — fall through to LLM path below. We do
+              // NOT mark this an error: short-circuit is best-effort, and
+              // the regular path still gives the user a reply.
+              log.warn('semantic-router short-circuit failed (db busy); falling back to LLM', {
+                intent: decision.intent,
+                traceId,
+              });
+            }
+          } else {
+            log.info('semantic-router short-circuit MATCHED but disabled by flag', {
+              intent: decision.intent,
+              conf: decision.rawConfidence.toFixed(3),
+              traceId,
+            });
+          }
+        } else if (decision?.kind === 'hint') {
+          const taggedText = buildHintTag(decision) + userText;
+          messageContent = JSON.stringify({ ...parsed, text: taggedText });
+          log.info('semantic-router hint applied', {
+            worker: decision.worker,
+            tier: decision.tier,
+            conf: decision.rawConfidence.toFixed(3),
+            topK: decision.topK.slice(0, 3),
+            traceId,
+          });
+        }
+      }
+    } catch (err) {
+      log.warn('semantic-router decision failed (continuing without hint)', {
+        err: err instanceof Error ? err.message : String(err),
+        traceId,
+      });
+    }
+  }
+
+  // Short-circuited messages skip inbound write + container wake entirely.
+  // The outbound row above is enough for delivery to send the reply.
+  if (shortCircuited) {
+    return;
+  }
+
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageIdForAgent(event.message.id, agent.agent_group_id),
     kind: event.message.kind,
@@ -543,7 +638,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content: messageContent,
     trigger: wake ? 1 : 0,
     traceId,
   });
