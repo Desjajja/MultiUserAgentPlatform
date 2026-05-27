@@ -21,8 +21,25 @@ export interface ChannelSetup {
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
-  /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
-  onAction(questionId: string, selectedOption: string, userId: string): void;
+  /**
+   * Called when a user clicks a button/action in a card (e.g.
+   * ask_user_question response).
+   *
+   * `extra` carries optional click metadata that adapters started
+   * surfacing in Phase 2: the button's display label, and the
+   * pendingAction payload that the agent embedded for L2 writes.
+   * Older adapters that don't pass `extra` still work — fields are
+   * undefined and the response handler just skips confirm-token minting.
+   */
+  onAction(
+    questionId: string,
+    selectedOption: string,
+    userId: string,
+    extra?: {
+      selectedLabel?: string;
+      pendingAction?: { operation: string; payload: Record<string, unknown> };
+    },
+  ): void;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */

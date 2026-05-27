@@ -26,6 +26,8 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { readEnvFile } from './env.js';
+import { resolveRolesForSession } from './erp-role-lookup.js';
 import { initGroupFilesystem } from './group-init.js';
 import { containerExitsTotal, wakeRejectedTotal } from './metrics.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -179,6 +181,20 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
+
+  // Resolve ERP roles for the user who triggered this spawn (latest
+  // inbound chat sender's open_id → /api/feishu/exchange-token → roles).
+  // The container uses this to pick role-specific skill reference files;
+  // empty list (unbound user, task message, lookup failed) falls back to
+  // the baseline-only skill set.
+  const userRoles = await resolveRolesForSession(agentGroup.id, session.id);
+  if (userRoles.length > 0) {
+    log.info('Resolved user roles for container spawn', {
+      sessionId: session.id,
+      roles: userRoles,
+    });
+  }
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -187,6 +203,7 @@ async function spawnContainer(session: Session): Promise<void> {
     provider,
     contribution,
     agentIdentifier,
+    userRoles,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -480,6 +497,7 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
+  userRoles: string[] = [],
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
@@ -503,6 +521,13 @@ async function buildContainerArgs(
   // Everything FrontLane-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // ERP user roles (host-resolved, comma-separated). Read by the
+  // agent-runner's inlineSkillFolder() to pick role-specific skill
+  // references. Empty USER_ROLES = baseline-only skill set.
+  if (userRoles.length > 0) {
+    args.push('-e', `USER_ROLES=${userRoles.join(',')}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -512,9 +537,12 @@ async function buildContainerArgs(
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection. Providers
-  // that receive their own direct credentials (currently openai/codex)
-  // don't need the gateway to spawn.
-  if (provider === 'openai' || provider === 'codex') {
+  // that receive their own direct credentials (currently openai/codex, plus
+  // Claude when ANTHROPIC_AUTH_TOKEN is set in .env) don't need the gateway
+  // to spawn.
+  const claudeDirectAuth = readEnvFile(['ANTHROPIC_AUTH_TOKEN']).ANTHROPIC_AUTH_TOKEN;
+  const skipGateway = provider === 'openai' || provider === 'codex' || (provider === 'claude' && !!claudeDirectAuth);
+  if (skipGateway) {
     log.info('Skipping OneCLI gateway for direct-credential provider', {
       containerName,
       provider,

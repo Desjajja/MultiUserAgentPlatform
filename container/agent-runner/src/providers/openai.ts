@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import * as fsForImages from 'node:fs';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -10,6 +11,7 @@ import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
   AgentQuery,
+  ImageAttachmentRef,
   McpServerConfig,
   ProviderEvent,
   ProviderOptions,
@@ -22,11 +24,28 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const MAX_REQUEST_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 1_500;
-const MAX_REPLAY_TRANSCRIPT_ITEMS = 128;
-const MAX_REPLAY_TRANSCRIPT_CHARS = 120_000;
+// Transcript replay budget. The OpenAI-compatible model gets sent
+// `[system prompt] + [transcript] + [new user message]` every turn — see
+// transcriptToChatMessages(). With system prompt ~150KB (CLAUDE.md +
+// inlined skill), capping transcript at ~400KB keeps total request well
+// under gpt-5.4's 200k-token (~600-700KB) limit while still giving room
+// for the running tool-call history of a real multi-turn business flow
+// (建单 → preview → ask_user_question → click → create).
+//
+// Why this size matters specifically: with non-blocking ask_user_question,
+// the agent's transcript across a card click can span days. We need to
+// retain enough history that the click-resumed turn sees the original
+// ask_user_question round + the ERP preview that informed it; otherwise
+// the agent has to re-query the world to figure out what it was doing.
+//
+// Bumped from 128 items / 120KB after observing that a typical build-an-
+// order flow produces ~12-20 transcript items totaling ~80KB, leaving
+// almost no headroom for multi-step approvals or scans.
+const MAX_REPLAY_TRANSCRIPT_ITEMS = 512;
+const MAX_REPLAY_TRANSCRIPT_CHARS = 400_000;
 const PREVIOUS_RESPONSE_UNSUPPORTED_RE = /previous_response_id.*(?:responses websocket v2|only supported)/i;
 const RESPONSES_TRANSPORT_FALLBACK_RE =
-  /non-json response \((502|503|504)\)|unreadable sse response \((502|503|504)\)|request failed with status (502|503|504)/i;
+  /non-json response \((502|503|504)\)|unreadable sse response \((502|503|504)\)|request failed with status (502|503|504)|upstream request failed|bad gateway|gateway timeout|service unavailable/i;
 const INVALID_SESSION_RE =
   /response.*not found|unknown response|invalid response|previous_response_id.*(?:not found|does not exist|invalid)/i;
 
@@ -254,7 +273,98 @@ function trimTranscript(items: JsonObject[]): JsonObject[] {
     total -= sizes[start] ?? 0;
     start += 1;
   }
-  return capped.slice(start);
+
+  // Heal a dangling function_call_output / tool message at the head.
+  //
+  // Both the OpenAI Responses API and Chat Completions API require every
+  // tool output to follow its matching function_call in the same message
+  // list. If trimming drops the preceding function_call but keeps its
+  // output, the next request fails with:
+  //   "No tool call found for function call output with call_id fc_xxx"
+  //   "未找到 call_id 为 fc_xxx 的函数调用输出对应的工具调用"
+  //
+  // Skip orphan tool messages at the new head until we land on something
+  // safe to start replay from (a user/assistant message or a fresh
+  // function_call followed by its output). Worst case we walk all the
+  // way to capped.length, returning [] — which is still a valid replay
+  // (the next user prompt drives a fresh round).
+  while (start < capped.length) {
+    const head = capped[start];
+    const headType = typeof head?.type === 'string' ? head.type : '';
+    const headRole = typeof head?.role === 'string' ? head.role : '';
+    if (headType === 'function_call_output' || headRole === 'tool') {
+      start += 1;
+      continue;
+    }
+    break;
+  }
+
+  // Pair-aware sweep: drop any function_call_output whose preceding
+  // function_call is missing AND any function_call whose function_call_output
+  // is missing.
+  //
+  // Why this matters even after the head-heal: in a multi-round transcript,
+  // a partial trim can land in the middle (e.g. call_X kept but call_Y
+  // and its preceding function_call got dropped between rounds). The
+  // upstream API rejects with the same error pointing at the orphan.
+  //
+  // Algorithm: build the set of call_ids present as function_call. Then
+  // filter: keep every item except function_call_output whose call_id
+  // isn't in the set. Also separately filter function_call without any
+  // matching output — though OpenAI is more forgiving about that
+  // direction (it just thinks the agent ignored its tool result), better
+  // safe than sorry.
+  const sliced = capped.slice(start);
+  const callIds = new Set<string>();
+  const outputIds = new Set<string>();
+  for (const item of sliced) {
+    if (!item || typeof item !== 'object') continue;
+    const t = (item as { type?: unknown }).type;
+    const cid = (item as { call_id?: unknown }).call_id;
+    if (typeof cid !== 'string' || !cid) continue;
+    if (t === 'function_call') callIds.add(cid);
+    else if (t === 'function_call_output') outputIds.add(cid);
+  }
+  const orphanOutputs = new Set<string>();
+  for (const id of outputIds) if (!callIds.has(id)) orphanOutputs.add(id);
+  const orphanCalls = new Set<string>();
+  for (const id of callIds) if (!outputIds.has(id)) orphanCalls.add(id);
+  if (orphanOutputs.size === 0 && orphanCalls.size === 0) return sliced;
+
+  return sliced.filter((item) => {
+    if (!item || typeof item !== 'object') return true;
+    const t = (item as { type?: unknown }).type;
+    const cid = (item as { call_id?: unknown }).call_id;
+    if (typeof cid !== 'string' || !cid) return true;
+    if (t === 'function_call' && orphanCalls.has(cid)) return false;
+    if (t === 'function_call_output' && orphanOutputs.has(cid)) return false;
+    return true;
+  });
+}
+
+/**
+ * Per-item cap for individual tool outputs.
+ *
+ * The agent's MCP tools occasionally return very large payloads:
+ * - erp_request listing all SKUs / orders / customers
+ * - read_file dumping a multi-MB CSV
+ * - read_image base64 of an 8MB photo (image_url path bypasses this, but
+ *   if the agent asks for raw bytes via read_image it lands here)
+ *
+ * trimTranscript drops whole items from the head, never partial, so one
+ * fat tool output sits in transcript forever and crowds out the recent
+ * rounds the agent actually needs to see. Truncate at write time and
+ * leave a marker so the agent knows to re-query with a tighter filter
+ * if it actually needs the missing data.
+ */
+const MAX_TOOL_OUTPUT_CHARS = 40_000;
+
+function capToolOutput(output: string): string {
+  if (output.length <= MAX_TOOL_OUTPUT_CHARS) return output;
+  return (
+    output.slice(0, MAX_TOOL_OUTPUT_CHARS) +
+    `\n\n[truncated — original was ${output.length} chars, only first ${MAX_TOOL_OUTPUT_CHARS} kept. If you need the rest, narrow your query with a filter/limit and call the tool again.]`
+  );
 }
 
 function appendTranscript(existing: JsonObject[], items: JsonObject[]): JsonObject[] {
@@ -262,17 +372,50 @@ function appendTranscript(existing: JsonObject[], items: JsonObject[]): JsonObje
   return trimTranscript([...existing, ...items.map((item) => cloneJson(item))]);
 }
 
-function userMessageInput(text: string): JsonObject {
+function userMessageInput(text: string, images: ImageAttachmentRef[] = []): JsonObject {
+  const content: JsonObject[] = [
+    {
+      type: 'input_text',
+      text,
+    },
+  ];
+  for (const img of images) {
+    const dataUrl = tryReadImageAsDataUrl(img);
+    if (!dataUrl) continue;
+    // OpenAI Responses API uses `input_image` with `image_url` (string).
+    // Chat-completions translation in transcriptToChatMessages maps this to
+    // `image_url` parts as well, so this one shape works for both transports.
+    content.push({
+      type: 'input_image',
+      image_url: dataUrl,
+    });
+  }
   return {
     type: 'message',
     role: 'user',
-    content: [
-      {
-        type: 'input_text',
-        text,
-      },
-    ],
+    content,
   };
+}
+
+const IMAGE_DATA_URL_MAX_BYTES = 8 * 1024 * 1024;
+
+function tryReadImageAsDataUrl(img: ImageAttachmentRef): string | null {
+  try {
+    const stat = fsForImages.statSync(img.localPath);
+    if (!stat.isFile() || stat.size > IMAGE_DATA_URL_MAX_BYTES) return null;
+    const bytes = fsForImages.readFileSync(img.localPath);
+    const mime = img.mimeType || mimeFromPath(img.localPath);
+    return `data:${mime};base64,${bytes.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+function mimeFromPath(p: string): string {
+  const m = p.toLowerCase().match(/\.(jpe?g|png|gif|webp|bmp|heic)$/);
+  if (!m) return 'application/octet-stream';
+  const ext = m[1] === 'jpg' ? 'jpeg' : m[1];
+  return `image/${ext}`;
 }
 
 function replayableOutputItems(output: OpenAIOutputItem[] | undefined): JsonObject[] {
@@ -416,6 +559,16 @@ function transcriptToChatMessages(transcript: JsonObject[], instructions?: strin
     if (type !== 'message') continue;
     const role = readString(item.role);
     if (!role) continue;
+    // For user messages with image parts, emit chat-completions style
+    // multi-part `content[]` so middlemen (d1token etc.) that only speak
+    // `/chat/completions` can still forward images to the model.
+    if (role === 'user' && Array.isArray(item.content)) {
+      const parts = convertUserContentToChatParts(item.content);
+      if (parts.length > 0) {
+        messages.push({ role, content: parts });
+        continue;
+      }
+    }
     const content = extractMessageTextContent(item.content);
     messages.push({
       role,
@@ -425,6 +578,41 @@ function transcriptToChatMessages(transcript: JsonObject[], instructions?: strin
 
   flushPendingToolCalls();
   return messages;
+}
+
+/**
+ * Translate the Responses-API user content shape (with `input_text` /
+ * `input_image` items) into the chat-completions multi-part `content[]`
+ * format (with `text` / `image_url` items).
+ *
+ * Falls back to a single-text part list when no recognized parts are
+ * present — caller decides whether to use those or flatten to a string.
+ */
+function convertUserContentToChatParts(content: unknown[]): JsonObject[] {
+  const parts: JsonObject[] = [];
+  for (const item of content) {
+    if (!isRecord(item)) continue;
+    const partType = readString(item.type);
+    if (partType === 'input_text' || partType === 'text') {
+      const text = readString(item.text);
+      if (text) parts.push({ type: 'text', text });
+      continue;
+    }
+    if (partType === 'input_image' || partType === 'image_url') {
+      // image_url may be either a string (Responses-API shape) or a
+      // { url, detail? } object (chat-completions-API shape). Accept both.
+      let url: string | undefined;
+      if (typeof item.image_url === 'string') {
+        url = readString(item.image_url);
+      } else if (isRecord(item.image_url)) {
+        url = readString(item.image_url.url);
+      }
+      if (url) {
+        parts.push({ type: 'image_url', image_url: { url } });
+      }
+    }
+  }
+  return parts;
 }
 
 function responseToolsToChatTools(tools: OpenAIFunctionTool[]): JsonObject[] {
@@ -703,6 +891,7 @@ export class OpenAIProvider implements AgentProvider {
   private readonly reasoningEffort?: string;
   private readonly timeoutMs: number;
   private readonly bridge: OpenAIMcpBridge;
+  private readonly forcedTransport: OpenAITransport | null;
 
   constructor(options: ProviderOptions = {}) {
     const env = options.env ?? {};
@@ -712,6 +901,13 @@ export class OpenAIProvider implements AgentProvider {
     this.reasoningEffort = readString(env.OPENAI_REASONING_EFFORT);
     this.timeoutMs = Number.parseInt(readString(env.OPENAI_TIMEOUT_MS) || '', 10) || DEFAULT_TIMEOUT_MS;
     this.bridge = new OpenAIMcpBridge(options.mcpServers ?? {}, env);
+    const transportEnv = readString(env.OPENAI_TRANSPORT)?.toLowerCase();
+    this.forcedTransport =
+      transportEnv === 'chat-completions' || transportEnv === 'chat'
+        ? 'chat-completions'
+        : transportEnv === 'responses'
+        ? 'responses'
+        : null;
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -721,9 +917,14 @@ export class OpenAIProvider implements AgentProvider {
 
   query(input: QueryInput): AgentQuery {
     let pendingFollowUp: string | null = null;
+    let pendingFollowUpImages: ImageAttachmentRef[] | null = null;
     let stopRequested = false;
     let activeAbort: AbortController | null = null;
     let continuation = input.continuation;
+    // Image attachments only apply to the very first turn. Follow-up
+    // pushes re-populate this slot via push(message, images) so a barcode
+    // photo arriving mid-stream still reaches the multi-modal channel.
+    let pendingImages: ImageAttachmentRef[] | undefined = input.imageAttachments;
 
     const events: AsyncIterable<ProviderEvent> = {
       [Symbol.asyncIterator]: async function* (this: OpenAIProvider) {
@@ -736,8 +937,11 @@ export class OpenAIProvider implements AgentProvider {
           activeAbort = controller;
 
           try {
+            const images = pendingImages;
+            pendingImages = undefined;
             const turn = await this.runTurn({
               prompt: currentPrompt,
+              imageAttachments: images,
               continuation,
               instructions: input.systemContext?.instructions,
               signal: controller.signal,
@@ -754,6 +958,8 @@ export class OpenAIProvider implements AgentProvider {
               if (pendingFollowUp) {
                 currentPrompt = pendingFollowUp;
                 pendingFollowUp = null;
+                pendingImages = pendingFollowUpImages ?? undefined;
+                pendingFollowUpImages = null;
                 continue;
               }
               if (stopRequested) return;
@@ -768,6 +974,8 @@ export class OpenAIProvider implements AgentProvider {
           if (pendingFollowUp) {
             currentPrompt = pendingFollowUp;
             pendingFollowUp = null;
+            pendingImages = pendingFollowUpImages ?? undefined;
+            pendingFollowUpImages = null;
             continue;
           }
 
@@ -777,8 +985,9 @@ export class OpenAIProvider implements AgentProvider {
     };
 
     return {
-      push(message: string) {
+      push(message: string, imageAttachments?: ImageAttachmentRef[]) {
         pendingFollowUp = message;
+        pendingFollowUpImages = imageAttachments ?? null;
         activeAbort?.abort();
       },
       end() {
@@ -794,6 +1003,7 @@ export class OpenAIProvider implements AgentProvider {
 
   private async runTurn(params: {
     prompt: string;
+    imageAttachments?: ImageAttachmentRef[];
     continuation?: string;
     instructions?: string;
     signal: AbortSignal;
@@ -806,10 +1016,13 @@ export class OpenAIProvider implements AgentProvider {
     const progressMessages: string[] = [];
     const restored = parseContinuationState(params.continuation);
     let mode: ContinuationMode = restored.mode;
-    let transport: OpenAITransport = restored.transport;
+    let transport: OpenAITransport = this.forcedTransport ?? restored.transport;
+    if (transport === 'chat-completions') {
+      mode = 'stateless';
+    }
     let previousResponseId = restored.mode === 'responses' ? restored.responseId : undefined;
     let transcript = trimTranscript(restored.transcript);
-    transcript = appendTranscript(transcript, [userMessageInput(params.prompt)]);
+    transcript = appendTranscript(transcript, [userMessageInput(params.prompt, params.imageAttachments)]);
     let nextInput: unknown =
       transport === 'chat-completions' || mode === 'stateless' ? transcript : transcript[transcript.length - 1];
 
@@ -901,7 +1114,14 @@ export class OpenAIProvider implements AgentProvider {
         }
 
         progressMessages.push(`Calling ${name}`);
-        const output = await this.bridge.callTool(name, readString(call.arguments));
+        const rawOutput = await this.bridge.callTool(name, readString(call.arguments));
+        // Per-item cap. A single tool returning a giant payload (e.g. a
+        // 200-SKU product list, a full Excel sheet) would otherwise sit
+        // in the transcript verbatim and never get trimmed by the
+        // total-size sweep — trimTranscript drops whole items from the
+        // head, never partial. Truncate here so a heavy round doesn't
+        // poison the next 50 turns' worth of replay.
+        const output = capToolOutput(rawOutput);
         toolOutputs.push({
           type: 'function_call_output',
           call_id: callId,

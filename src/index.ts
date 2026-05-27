@@ -114,7 +114,7 @@ async function main(): Promise<void> {
           isGroup,
         });
       },
-      onAction(questionId, selectedOption, userId) {
+      onAction(questionId, selectedOption, userId, extra) {
         dispatchResponse({
           questionId,
           value: selectedOption,
@@ -125,6 +125,8 @@ async function main(): Promise<void> {
           // pending_question / pending_approval row.
           platformId: '',
           threadId: null,
+          selectedLabel: extra?.selectedLabel,
+          pendingAction: extra?.pendingAction,
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });

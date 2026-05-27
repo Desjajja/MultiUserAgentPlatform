@@ -16,6 +16,18 @@ const OPENAI_ENV_KEYS = [
   'OPENAI_MODEL',
   'OPENAI_REASONING_EFFORT',
   'OPENAI_TIMEOUT_MS',
+  // Force `chat-completions` for relays (e.g. d1token) that don't implement
+  // OpenAI's newer `/responses` endpoint. Values: chat-completions | responses.
+  'OPENAI_TRANSPORT',
+  // ERP backend coords for the xinjiulong-erp skill. Same envs the Claude
+  // provider passes through — keeps skill-side curl calls working regardless
+  // of which LLM provider the group runs.
+  'ERP_BASE_URL',
+  'ERP_AGENT_SERVICE_KEY',
+  // HMAC signing secret for ERP /api/agent/* gateway. Container's
+  // erp_execute MCP tool reads this to sign each request. Same value as
+  // the ERP backend's FRONTLANE_HMAC_SECRET.
+  'FRONTLANE_HMAC_SECRET',
 ] as const;
 
 function buildOpenAIContribution(): ProviderContainerContribution {

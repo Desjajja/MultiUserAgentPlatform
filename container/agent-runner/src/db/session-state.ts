@@ -77,3 +77,69 @@ export function setContinuation(providerName: string, id: string): void {
 export function clearContinuation(providerName: string): void {
   deleteValue(continuationKey(providerName));
 }
+
+/**
+ * Pending image queue.
+ *
+ * When the user dumps a stack of barcode / receipt photos, naively inlining
+ * all of them into one user-message blows the request body and overwhelms
+ * the model. Instead we enqueue everything past the per-turn limit here
+ * and let the agent walk the queue at its own pace via the
+ * `next_image_batch` MCP tool.
+ *
+ * Persisted in outbound.db so the queue survives container restarts (e.g.
+ * non-blocking ask_user_question puts the agent to sleep mid-batch).
+ */
+const IMAGE_QUEUE_KEY = 'image_queue';
+
+export interface QueuedImage {
+  /** Absolute path inside /workspace/inbox/<msgId>/<file>. */
+  localPath: string;
+  mimeType?: string;
+  /** Display name (used by attachment-naming.ts). */
+  name?: string;
+  /** Source inbound message id, for traceability. */
+  sourceMessageId?: string;
+  /** When the host enqueued this image (epoch ms). */
+  enqueuedAt: number;
+}
+
+export function getImageQueue(): QueuedImage[] {
+  const raw = getValue(IMAGE_QUEUE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is QueuedImage =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as { localPath?: unknown }).localPath === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function setImageQueue(queue: QueuedImage[]): void {
+  if (queue.length === 0) {
+    deleteValue(IMAGE_QUEUE_KEY);
+    return;
+  }
+  setValue(IMAGE_QUEUE_KEY, JSON.stringify(queue));
+}
+
+export function appendImageQueue(items: QueuedImage[]): void {
+  if (items.length === 0) return;
+  setImageQueue([...getImageQueue(), ...items]);
+}
+
+/** Pop up to `count` from the head, leaving the rest in place. */
+export function popImageQueue(count: number): QueuedImage[] {
+  const queue = getImageQueue();
+  if (queue.length === 0 || count <= 0) return [];
+  const taken = queue.slice(0, count);
+  const remaining = queue.slice(count);
+  setImageQueue(remaining);
+  return taken;
+}

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
@@ -9,6 +11,7 @@ import {
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import { appendImageQueue, getImageQueue, popImageQueue, type QueuedImage } from './db/session-state.js';
 import { a2aOriginUserId } from './a2a-origin.js';
 import {
   clearCurrentClassificationId,
@@ -25,7 +28,7 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ImageAttachmentRef, ProviderEvent } from './providers/types.js';
 import { clearRequestIdentity, getRequestIdentity, setRequestIdentity } from './request-context.js';
 import { resolveBatchIdentity, splitBatchByTurn } from './request-identity.js';
 
@@ -125,6 +128,126 @@ export function classifyProviderError(errMsg: string, sessionInvalid: boolean): 
   return 'unknown';
 }
 
+const QUEUE_CONTINUATION_SENTINEL = '/workspace/.queue_continuation';
+
+/**
+ * Synthetic chat row used to wake a fresh turn when the agent's
+ * `next_image_batch` MCP tool drops a sentinel. The synthNote field is a
+ * non-standard extension to MessageInRow used only by our injection path,
+ * for diagnostics; treat as ambient metadata.
+ */
+type SyntheticMessageInRow = MessageInRow & { synthNote?: string };
+
+function consumeQueueContinuationSentinel(): SyntheticMessageInRow | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(QUEUE_CONTINUATION_SENTINEL, 'utf-8');
+  } catch {
+    return null;
+  }
+  // Best-effort cleanup so we don't keep resurfacing the same continuation
+  // forever if the synth row gets ignored downstream.
+  try {
+    fs.unlinkSync(QUEUE_CONTINUATION_SENTINEL);
+  } catch {
+    // ignore
+  }
+  let note = '';
+  try {
+    const parsed = JSON.parse(raw) as { note?: unknown };
+    if (typeof parsed.note === 'string') note = parsed.note;
+  } catch {
+    // sentinel file was malformed; the wake-up itself is still useful
+  }
+  const id = `queue-cont-${Date.now()}`;
+  const text = note
+    ? `[image_queue] 上一 turn 调了 next_image_batch。${note}`
+    : '[image_queue] 上一 turn 调了 next_image_batch，继续处理下一批图片。';
+  return {
+    id,
+    seq: null,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    status: 'pending',
+    process_after: null,
+    recurrence: null,
+    tries: 0,
+    trigger: 1,
+    platform_id: null,
+    channel_type: null,
+    thread_id: null,
+    content: JSON.stringify({ text, sender: 'system', senderId: '', kind: 'image_queue_continuation' }),
+    origin_user_id: null,
+    synthNote: note,
+  };
+}
+
+/**
+ * Walk the chat messages in a turn batch and pull out image attachment
+ * references in the order they appeared in user input. Skips non-image
+ * attachments — those have no special multi-modal channel today and the
+ * formatter already drops a `[file: ... — saved to ...]` breadcrumb so the
+ * agent can read/process them via tools if it ever needs to.
+ *
+ * Queue-aware: incoming images are first appended to the persistent image
+ * queue (so a 20-photo dump doesn't get dropped), then the head of the
+ * queue (cap = MAX_IMAGES_PER_TURN) is returned for inline. Whatever
+ * remains stays queued for the agent to pull via `next_image_batch`.
+ */
+const MAX_IMAGES_PER_TURN = 2;
+
+function extractImageAttachments(messages: MessageInRow[]): {
+  inline: ImageAttachmentRef[];
+  remainingQueueSize: number;
+} {
+  const incoming: QueuedImage[] = [];
+  for (const msg of messages) {
+    if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') continue;
+    let parsed: { attachments?: unknown };
+    try {
+      parsed = JSON.parse(msg.content) as { attachments?: unknown };
+    } catch {
+      continue;
+    }
+    const list = parsed.attachments;
+    if (!Array.isArray(list)) continue;
+    for (const att of list) {
+      if (!att || typeof att !== 'object') continue;
+      const record = att as Record<string, unknown>;
+      const localPath = typeof record.localPath === 'string' ? record.localPath : '';
+      if (!localPath) continue;
+      const mimeType = typeof record.mimeType === 'string' ? record.mimeType : '';
+      // Only inline image MIME types — videos/PDFs/audio aren't multi-modal
+      // here, and channels that set MIME for non-images would otherwise
+      // bloat the prompt with random binaries.
+      const looksImage =
+        mimeType.toLowerCase().startsWith('image/') ||
+        /\.(jpe?g|png|gif|webp|bmp|heic)$/i.test(localPath);
+      if (!looksImage) continue;
+      const name = typeof record.name === 'string' ? record.name : undefined;
+      const abs = localPath.startsWith('/') ? localPath : `/workspace/${localPath}`;
+      incoming.push({
+        localPath: abs,
+        mimeType: mimeType || undefined,
+        name,
+        sourceMessageId: msg.id,
+        enqueuedAt: Date.now(),
+      });
+    }
+  }
+  if (incoming.length > 0) {
+    appendImageQueue(incoming);
+  }
+  const taken = popImageQueue(MAX_IMAGES_PER_TURN);
+  const inline: ImageAttachmentRef[] = taken.map((q) => ({
+    localPath: q.localPath,
+    mimeType: q.mimeType,
+    name: q.name,
+  }));
+  const remainingQueueSize = getImageQueue().length;
+  return { inline, remainingQueueSize };
+}
+
 function formatUserFacingError(errMsg: string): string {
   const normalized = errMsg.toLowerCase();
   if (
@@ -194,6 +317,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+
+    // Check for queue continuation sentinel — the `next_image_batch` tool
+    // drops this when the agent wants the next image batch to land in a
+    // fresh turn. We synthesize an in-memory chat row so the existing
+    // batching path inlines the queue head without needing to write into
+    // host-owned inbound.db (which would race the host writer).
+    const queueContinuation = consumeQueueContinuationSentinel();
+    if (queueContinuation) {
+      messages.push(queueContinuation);
+      log(
+        `Queue continuation triggered; injecting synthetic chat row (note="${queueContinuation.synthNote ?? ''}")`,
+      );
+    }
+
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -327,10 +464,29 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
-    log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+    // Pull out image attachments from this batch's chat messages so
+    // multi-modal-capable providers can inline them. The text prompt still
+    // references the localPath via formatAttachments(), so providers that
+    // ignore this field still get a textual breadcrumb.
+    //
+    // Queue-aware: if more images are pending than MAX_IMAGES_PER_TURN, we
+    // inline the head and tell the agent (via prompt prefix) how many
+    // remain so it can call `next_image_batch` after processing this batch.
+    const { inline: imageAttachments, remainingQueueSize } = extractImageAttachments(keep);
+    const promptWithQueueHint =
+      remainingQueueSize > 0
+        ? `${prompt}\n\n<image_queue pending="${remainingQueueSize}">${imageAttachments.length} 张图片已 inline 给你；还有 ${remainingQueueSize} 张排队等待。处理完本批后调 \`next_image_batch\` 拉下一批（默认每批 ${MAX_IMAGES_PER_TURN} 张）。</image_queue>`
+        : prompt;
+
+    log(
+      `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
+        (imageAttachments.length > 0 ? ` images=${imageAttachments.length}` : '') +
+        (remainingQueueSize > 0 ? ` queued=${remainingQueueSize}` : ''),
+    );
 
     const query = config.provider.query({
-      prompt,
+      prompt: promptWithQueueHint,
+      imageAttachments: imageAttachments.length > 0 ? imageAttachments : undefined,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -413,6 +569,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
     log(`Completed ${turnMessages.length} message(s) this turn (${ids.length} claimed at tick start)`);
+
+    // Auto-drain the image queue. If the agent finished a turn while
+    // images are still queued, drop the sentinel so the very next poll
+    // tick wakes a fresh turn with the next batch — don't rely on the
+    // model remembering to call `next_image_batch`. Without this, a 10-
+    // photo dump used to die after the first batch because the agent
+    // would think it was done. The sentinel-file path is cheap (a few
+    // ms) and idempotent — a sentinel that's already on disk just keeps
+    // sitting there for the next iteration to pick up.
+    if (getImageQueue().length > 0 && !fs.existsSync('/workspace/.queue_continuation')) {
+      try {
+        fs.writeFileSync(
+          '/workspace/.queue_continuation',
+          JSON.stringify({
+            note: '系统自动续传：队列里还有图片没处理完。',
+            requestedAt: new Date().toISOString(),
+            autoDrain: true,
+          }),
+          'utf-8',
+        );
+        log(`Auto-drain: image queue has ${getImageQueue().length} items left, scheduled next turn`);
+      } catch (err) {
+        log(`Auto-drain failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 }
 
@@ -569,8 +750,17 @@ async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
-        log(`Pushing ${keep.length} follow-up message(s) into active query`);
-        query.push(prompt);
+        const { inline: followUpImages, remainingQueueSize: followUpRemaining } = extractImageAttachments(keep);
+        const promptWithQueueHint =
+          followUpRemaining > 0
+            ? `${prompt}\n\n<image_queue pending="${followUpRemaining}">${followUpImages.length} 张图片已 inline；队列还剩 ${followUpRemaining} 张。处理完本批后调 \`next_image_batch\` 继续。</image_queue>`
+            : prompt;
+        log(
+          `Pushing ${keep.length} follow-up message(s) into active query` +
+            (followUpImages.length > 0 ? ` (with ${followUpImages.length} image(s))` : '') +
+            (followUpRemaining > 0 ? ` queued=${followUpRemaining}` : ''),
+        );
+        query.push(promptWithQueueHint, followUpImages.length > 0 ? followUpImages : undefined);
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node

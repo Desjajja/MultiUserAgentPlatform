@@ -32,6 +32,16 @@ export interface QueryInput {
   prompt: string;
 
   /**
+   * Image attachments tied to the messages this prompt was built from.
+   * Multi-modal-capable providers (e.g. OpenAI chat-completions) inline these
+   * as `image_url` content parts so the model can actually see the pixels.
+   * Providers that don't support image input ignore this field — the text
+   * prompt already mentions the localPath, so the agent can still call
+   * `read_image` to fetch bytes itself if it has another use for them.
+   */
+  imageAttachments?: ImageAttachmentRef[];
+
+  /**
    * Opaque continuation token from a previous query. The provider decides
    * what this means (session ID, thread ID, nothing at all).
    */
@@ -49,6 +59,15 @@ export interface QueryInput {
   };
 }
 
+export interface ImageAttachmentRef {
+  /** Absolute path inside /workspace/inbox/<msgId>/<file>. */
+  localPath: string;
+  /** MIME type (`image/jpeg` etc.). Falls back to derive-from-extension. */
+  mimeType?: string;
+  /** Human label — usually `image-<n>-<keyTail>.<ext>`. */
+  name?: string;
+}
+
 export interface McpServerConfig {
   command: string;
   args: string[];
@@ -56,8 +75,17 @@ export interface McpServerConfig {
 }
 
 export interface AgentQuery {
-  /** Push a follow-up message into the active query. */
-  push(message: string): void;
+  /**
+   * Push a follow-up message into the active query.
+   *
+   * `imageAttachments` lets the host re-inline images on a mid-stream
+   * push (e.g. a barcode photo arriving while the agent is mid-turn for
+   * an out-of-stock confirmation). Providers that don't support
+   * multi-modal input ignore the field — the text prompt still mentions
+   * the localPath via formatAttachments(), so the agent can call
+   * `read_image` directly if it has another use for the bytes.
+   */
+  push(message: string, imageAttachments?: ImageAttachmentRef[]): void;
 
   /** Signal that no more input will be sent. */
   end(): void;

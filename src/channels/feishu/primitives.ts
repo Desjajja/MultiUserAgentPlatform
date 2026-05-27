@@ -218,10 +218,88 @@ export function parseTextContent(rawContent: string, messageType: string): strin
   if (messageType === 'interactive') {
     return parseInteractiveCardContent(parsed);
   }
+  if (messageType === 'image') {
+    // The bytes get downloaded + saved by the inbound pipeline as an
+    // attachment; the agent receives a localPath in its inbox/.
+    return '[图片]';
+  }
+  if (messageType === 'file') {
+    // Try to surface the original filename so the agent has a starting
+    // point even before it inspects attachments[].
+    const name = readString(parsed.file_name);
+    return name ? `[文件: ${name}]` : '[文件]';
+  }
 
   if (typeof parsed.text === 'string' && parsed.text.trim()) return parsed.text;
   if (typeof parsed.title === 'string' && parsed.title.trim()) return parsed.title;
   return `[${messageType || 'unknown'} message]`;
+}
+
+/**
+ * Extract image_keys from a Feishu inbound message's content payload.
+ * Returns an empty array when none are present.
+ *
+ * Feishu shapes:
+ *   - image messages: { image_key: "img_v3_..." }
+ *   - post messages with embedded images: nodes have tag === 'img' with image_key
+ */
+export function extractImageKeys(rawContent: string, messageType: string): string[] {
+  if (!rawContent) return [];
+  const parsed = parseJsonObject(rawContent);
+  if (!parsed) return [];
+  const keys: string[] = [];
+  if (messageType === 'image') {
+    const k = readString(parsed.image_key);
+    if (k) keys.push(k);
+  }
+  if (messageType === 'post' && Array.isArray(parsed.content)) {
+    for (const row of parsed.content) {
+      if (!Array.isArray(row)) continue;
+      for (const node of row) {
+        if (!isRecord(node)) continue;
+        if (readString(node.tag) !== 'img') continue;
+        const k = readString(node.image_key);
+        if (k) keys.push(k);
+      }
+    }
+  }
+  return keys;
+}
+
+/**
+ * Extract file attachment metadata from a Feishu inbound payload.
+ * Returns one entry per file with the bits we need to (a) decide whether
+ * to download and (b) name the saved file.
+ *
+ * Feishu file shape:
+ *   { file_key: "file_v3_...", file_name: "...", file_size: <bytes>, file_type: "doc"|"xlsx"|... }
+ *
+ * `file_type` is Feishu's own taxonomy (doc, xlsx, pdf, etc); we use it
+ * as a hint when file_name lacks an extension.
+ */
+export interface FeishuFileRef {
+  fileKey: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+}
+
+export function extractFileRefs(rawContent: string, messageType: string): FeishuFileRef[] {
+  if (!rawContent || messageType !== 'file') return [];
+  const parsed = parseJsonObject(rawContent);
+  if (!parsed) return [];
+  const fileKey = readString(parsed.file_key);
+  if (!fileKey) return [];
+  const fileName = readString(parsed.file_name) || 'attachment';
+  const fileType = (readString(parsed.file_type) || '').toLowerCase();
+  const sizeRaw = parsed.file_size;
+  const fileSize =
+    typeof sizeRaw === 'number' && Number.isFinite(sizeRaw)
+      ? sizeRaw
+      : typeof sizeRaw === 'string'
+      ? Number.parseInt(sizeRaw, 10) || 0
+      : 0;
+  return [{ fileKey, fileName, fileType, fileSize }];
 }
 
 export function parsePostContent(parsed: Record<string, unknown>): string {
@@ -385,6 +463,18 @@ export function parseFeishuQuestionActionPayload(value: unknown, now = Date.now(
     typeof value.expiresAt === 'number' && Number.isFinite(value.expiresAt) ? value.expiresAt : undefined;
   if (!questionId || !selectedOption) return null;
   if (expiresAt !== undefined && expiresAt < now) return null;
+  // pendingAction is embedded per-button when the agent set it on the
+  // option. Round-trip it back so handleCardAction can sign a
+  // confirm-token bound to this specific (operation, payload).
+  let pendingAction: FeishuQuestionActionPayload['pendingAction'] | undefined;
+  const rawAction = (value as Record<string, unknown>).pendingAction;
+  if (isRecord(rawAction)) {
+    const operation = readString(rawAction.operation);
+    if (operation) {
+      const payload = isRecord(rawAction.payload) ? (rawAction.payload as Record<string, unknown>) : {};
+      pendingAction = { operation, payload };
+    }
+  }
   return {
     kind: 'frontlane.ask_question',
     questionId,
@@ -392,6 +482,7 @@ export function parseFeishuQuestionActionPayload(value: unknown, now = Date.now(
     selectedLabel,
     expectedUserId,
     expiresAt,
+    pendingAction,
   };
 }
 
@@ -408,7 +499,19 @@ export function normalizeOptions(raw: unknown): NormalizedQuestionOption[] {
     const value = readString(entry.value) || label;
     const selectedLabel = readString(entry.selectedLabel) || label;
     if (!label || !value) continue;
-    out.push({ label, value, selectedLabel: selectedLabel || label });
+    const opt: NormalizedQuestionOption = { label, value, selectedLabel: selectedLabel || label };
+    // Carry through optional L2 pendingAction. Reject anything malformed
+    // — a button without a usable operation field shouldn't sneak through
+    // because that's how confirm-token signing decides whether to mint.
+    const action = entry.action;
+    if (isRecord(action)) {
+      const operation = readString(action.operation);
+      if (operation) {
+        const payload = isRecord(action.payload) ? (action.payload as Record<string, unknown>) : {};
+        opt.pendingAction = { operation, payload };
+      }
+    }
+    out.push(opt);
   }
   return out;
 }
@@ -438,6 +541,52 @@ export function buildFeishuAskQuestionCardWithPayloads(params: {
   expectedUserId?: string;
   expiresAt?: number;
 }): Record<string, unknown> {
+  // Feishu card schema v2 dropped the legacy `tag: "action"` container that
+  // wrapped a list of buttons (ErrCode 200861 "cards of schema V2 no longer
+  // support this capability; unsupported tag action"). The new shape lays
+  // buttons out as a column_set so they sit on a single row.
+  //
+  // Behavior we keep from the old shape:
+  //   - First option styled `primary` (the "do it" button)
+  //   - Each button's `value` carries the same payload struct
+  //     (kind / questionId / selectedOption / selectedLabel / expectedUserId /
+  //     expiresAt) so handleCardAction parsing is unchanged.
+  //   - Top-level `value` (not `behaviors[].value`) — Feishu's card.action.trigger
+  //     event surfaces this verbatim as `event.action.value` regardless of card
+  //     schema, so the existing parseFeishuQuestionActionPayload keeps working.
+  const buttons = params.options.map((option, index) => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: option.label },
+    type: index === 0 ? 'primary' : 'default',
+    value: {
+      kind: `${PLATFORM_PROTOCOL_NAMESPACE}.ask_question`,
+      questionId: params.questionId,
+      selectedOption: option.value,
+      selectedLabel: option.selectedLabel,
+      // Embed the original title + question so the click handler can
+      // re-render a "confirmed" view of the same card without round-tripping
+      // through the DB. Cost: each button payload carries ~the same text
+      // (~1KB usually), but Feishu accepts payloads up to 8KB per element
+      // and the savings of avoiding a pending_questions JOIN are worth it.
+      cardTitle: params.title,
+      cardQuestion: params.question,
+      ...(option.pendingAction
+        ? {
+            // Per-button L2 action — handleCardAction signs a confirm-token
+            // bound to this specific (operation, payload) when the user
+            // clicks. Buttons without pendingAction (cancel / later)
+            // intentionally omit it so no token gets minted.
+            pendingAction: {
+              operation: option.pendingAction.operation,
+              payload: option.pendingAction.payload,
+            },
+          }
+        : {}),
+      ...(params.expectedUserId ? { expectedUserId: params.expectedUserId } : {}),
+      ...(params.expiresAt ? { expiresAt: params.expiresAt } : {}),
+    },
+  }));
+
   return {
     schema: '2.0',
     config: { width_mode: 'fill' },
@@ -449,24 +598,100 @@ export function buildFeishuAskQuestionCardWithPayloads(params: {
       elements: [
         { tag: 'markdown', content: params.question },
         {
-          tag: 'action',
-          actions: params.options.map((option, index) => ({
-            tag: 'button',
-            text: { tag: 'plain_text', content: option.label },
-            type: index === 0 ? 'primary' : 'default',
-            value: {
-              kind: `${PLATFORM_PROTOCOL_NAMESPACE}.ask_question`,
-              questionId: params.questionId,
-              selectedOption: option.value,
-              selectedLabel: option.selectedLabel,
-              ...(params.expectedUserId ? { expectedUserId: params.expectedUserId } : {}),
-              ...(params.expiresAt ? { expiresAt: params.expiresAt } : {}),
-            },
+          tag: 'column_set',
+          flex_mode: 'stretch',
+          horizontal_spacing: '8px',
+          columns: buttons.map((btn) => ({
+            tag: 'column',
+            width: 'weighted',
+            weight: 1,
+            elements: [btn],
           })),
         },
       ],
     },
   };
+}
+
+/**
+ * Build the "post-click" version of an ask_question card. Called from
+ * handleCardAction right after a user picks an option. Renders:
+ *   - the original markdown question (preserved so context isn't lost)
+ *   - a single info row instead of buttons: "✓ 已确认（label）" or
+ *     "✗ 已取消（label）" depending on what got picked
+ *   - an italic footer "由 <name> 于 HH:MM 处理"
+ *
+ * The header keeps the original title and template but the buttons are
+ * replaced with a non-interactive markdown line — clicking the card again
+ * does nothing. This gives the user instant visual feedback while the
+ * agent's follow-up turn (which actually performs the action) is still
+ * running.
+ *
+ * `acceptedLabels` is the set of selectedOption values that should render
+ * the green check style (typically the primary/affirmative options like
+ * "approve" / "confirm"). Anything else renders with a red ✗.
+ */
+export function buildFeishuAskQuestionConfirmedCard(params: {
+  title: string;
+  question: string;
+  selectedLabel: string;
+  selectedOption: string;
+  operatorName?: string;
+  whenIso?: string;
+  approveLikeOptions?: ReadonlyArray<string>;
+}): Record<string, unknown> {
+  const approveLike = new Set(
+    (params.approveLikeOptions ?? ['approve', 'confirm', 'yes', 'ok']).map((v) => v.toLowerCase()),
+  );
+  const isApprove = approveLike.has(params.selectedOption.toLowerCase());
+  const mark = isApprove ? '✓' : '✗';
+  const color = isApprove ? 'green' : 'red';
+  // Strip a leading ✓/✗/check/×/⨯ from selectedLabel so the prepended mark
+  // doesn't double up ("✓ ✓ 确认通过"). Buttons commonly carry their own
+  // glyph in the label for the unclicked state.
+  const cleanLabel = params.selectedLabel.replace(/^[\s ]*[✓✗×⨯⊘√✕✘✓✗][\s ]+/u, '');
+  // Feishu V2 card click events don't surface operator.name (only open_id),
+  // so omit the "由 X" prefix entirely unless we genuinely have a name.
+  const who = params.operatorName ? `由 ${params.operatorName} ` : '';
+  let timeText = '';
+  if (params.whenIso) {
+    try {
+      const d = new Date(params.whenIso);
+      const hh = `${d.getHours()}`.padStart(2, '0');
+      const mm = `${d.getMinutes()}`.padStart(2, '0');
+      timeText = `于 ${hh}:${mm} `;
+    } catch {
+      // Ignore — footer just omits the time.
+    }
+  }
+  return {
+    schema: '2.0',
+    config: { width_mode: 'fill' },
+    header: {
+      title: { tag: 'plain_text', content: params.title },
+      template: 'blue',
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: params.question },
+        {
+          tag: 'markdown',
+          content: `<font color="${color}">**${mark} ${escapeMarkdown(cleanLabel)}**</font>`,
+        },
+        {
+          tag: 'markdown',
+          content: `<font color="grey">${who}${timeText}处理</font>`,
+        },
+      ],
+    },
+  };
+}
+
+function escapeMarkdown(s: string): string {
+  // Feishu's markdown shares enough syntax with CommonMark that bracket /
+  // emphasis chars in user-supplied labels can break the rendered card.
+  // Minimal escape — labels are short and we're rendering, not parsing.
+  return s.replace(/([*_`[\]<>])/g, '\\$1');
 }
 
 export function buildDisplayCard(content: Record<string, unknown>): Record<string, unknown> {

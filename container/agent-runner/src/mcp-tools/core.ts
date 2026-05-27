@@ -311,4 +311,10 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-registerTools([sendMessage, sendFile, editMessage, addReaction]);
+// Minimal tool set: only send_message. Other tools (send_file, edit_message,
+// add_reaction) are defined above for re-enablement later but not registered
+// — relays like d1token's OpenAI-protocol surface return 502 when too many
+// MCP tool schemas hit them, and `<message>` blocks in the agent's reply
+// already cover the common case. Re-enable individual tools if a workflow
+// truly needs them.
+registerTools([sendMessage]);

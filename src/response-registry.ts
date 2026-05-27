@@ -19,6 +19,22 @@ export interface ResponsePayload {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  /**
+   * The button's display label (after the user clicked). Distinct from
+   * `value`, which is the internal `value` the agent sees. Used for
+   * cleaner inbound text and for the patched card's "✓ <label>" ack.
+   */
+  selectedLabel?: string;
+  /**
+   * Optional L2 write payload carried on the clicked button. When set,
+   * the host's interactive module asks ERP to mint a one-shot
+   * X-User-Confirm token bound to (clicker, action, payload_hash) and
+   * stamps it into the agent-facing inbound row.
+   */
+  pendingAction?: {
+    operation: string;
+    payload: Record<string, unknown>;
+  };
 }
 
 export type ResponseHandler = (payload: ResponsePayload) => Promise<boolean>;
