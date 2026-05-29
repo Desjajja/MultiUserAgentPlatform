@@ -18,7 +18,10 @@
  * for policy refusals.
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
+import { withSpan } from './observability/with-span.js';
+import { storeSessionSpanContext } from './observability/context-bridge.js';
 import { gateCommand } from './command-gate.js';
+import { getActiveSpan } from './observability/tracer.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -165,16 +168,22 @@ function isUserScopedSessionMode(
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
-  const endTimer = startTimer('route');
-  try {
-    await routeInboundInner(event);
-    inboundTotal.labels(event.channelType, 'accepted').inc();
-  } catch (err) {
-    inboundTotal.labels(event.channelType, 'rejected').inc();
-    throw err;
-  } finally {
-    endTimer();
-  }
+  await withSpan(
+    'router.route',
+    { 'channel.type': event.channelType || 'unknown' },
+    async () => {
+      const endTimer = startTimer('route');
+      try {
+        await routeInboundInner(event);
+        inboundTotal.labels(event.channelType, 'accepted').inc();
+      } catch (err) {
+        inboundTotal.labels(event.channelType, 'rejected').inc();
+        throw err;
+      } finally {
+        endTimer();
+      }
+    },
+  );
 }
 
 async function routeInboundInner(event: InboundEvent): Promise<void> {
@@ -483,108 +492,123 @@ async function deliverToAgent(
   effectiveSessionMode: MessagingGroupAgent['session_mode'],
   wake: boolean,
 ): Promise<void> {
-  if (isUserScopedSessionMode(effectiveSessionMode) && !userId) {
-    throw new Error(`userId is required for session_mode=${effectiveSessionMode}`);
-  }
+  await withSpan(
+    'router.deliver_to_agent',
+    { 'agent.group.id': agent.agent_group_id },
+    async () => {
+      if (isUserScopedSessionMode(effectiveSessionMode) && !userId) {
+        throw new Error(`userId is required for session_mode=${effectiveSessionMode}`);
+      }
 
-  const { session, created } = resolveSession(
-    agent.agent_group_id,
-    mg.id,
-    event.threadId,
-    effectiveSessionMode,
-    userId,
-  );
+      const { session, created } = resolveSession(
+        agent.agent_group_id,
+        mg.id,
+        event.threadId,
+        effectiveSessionMode,
+        userId,
+      );
 
-  // The inbound row's (channel_type, platform_id, thread_id) is the address
-  // the agent's reply will be delivered to. Normally it mirrors the source
-  // (stamped from the event). When the caller supplied `replyTo` (CLI admin
-  // transport acting on operator intent), the reply is redirected there.
-  const deliveryAddr = event.replyTo ?? {
-    channelType: event.channelType,
-    platformId: event.platformId,
-    threadId: event.threadId,
-  };
+      const span = getActiveSpan();
+      if (span) {
+        storeSessionSpanContext(session.id, span.spanContext());
+      }
 
-  // Command gate: classify slash commands before they reach the container.
-  // Filtered commands are dropped silently. Denied admin commands get a
-  // permission-denied response written directly to messages_out.
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
-    if (gate.action === 'filter') {
-      log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
-      return;
-    }
-    if (gate.action === 'deny') {
-      const ok = writeOutboundDirect(session.agent_group_id, session.id, {
-        id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
+      // The inbound row's (channel_type, platform_id, thread_id) is the address
+      // the agent's reply will be delivered to. Normally it mirrors the source
+      // (stamped from the event). When the caller supplied `replyTo` (CLI admin
+      // transport acting on operator intent), the reply is redirected there.
+      const deliveryAddr = event.replyTo ?? {
+        channelType: event.channelType,
+        platformId: event.platformId,
+        threadId: event.threadId,
+      };
+
+      // Command gate: classify slash commands before they reach the container.
+      // Filtered commands are dropped silently. Denied admin commands get a
+      // permission-denied response written directly to messages_out.
+      if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+        const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+        if (gate.action === 'filter') {
+          log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+          return;
+        }
+        if (gate.action === 'deny') {
+          const ok = writeOutboundDirect(session.agent_group_id, session.id, {
+            id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            kind: 'chat',
+            platformId: deliveryAddr.platformId,
+            channelType: deliveryAddr.channelType,
+            threadId: deliveryAddr.threadId,
+            content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
+            inReplyTo: event.message.id,
+          });
+          if (!ok) {
+            log.warn('Admin deny response dropped (outbound.db busy)', {
+              command: gate.command,
+              userId,
+              agentGroupId: agent.agent_group_id,
+            });
+          } else {
+            log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
+          }
+          return;
+        }
+      }
+
+      writeSessionMessage(session.agent_group_id, session.id, {
+        id: messageIdForAgent(event.message.id, agent.agent_group_id),
+        kind: event.message.kind,
+        timestamp: event.message.timestamp,
         platformId: deliveryAddr.platformId,
         channelType: deliveryAddr.channelType,
         threadId: deliveryAddr.threadId,
-        content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
-        inReplyTo: event.message.id,
+        content: event.message.content,
+        trigger: wake ? 1 : 0,
       });
-      if (!ok) {
-        log.warn('Admin deny response dropped (outbound.db busy)', {
-          command: gate.command,
-          userId,
-          agentGroupId: agent.agent_group_id,
-        });
-      } else {
-        log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
+
+      log.info('Message routed', {
+        sessionId: session.id,
+        agentGroup: agent.agent_group_id,
+        engage_mode: agent.engage_mode,
+        kind: event.message.kind,
+        userId,
+        wake,
+        created,
+        agentGroupName: agentGroup.name,
+      });
+
+      if (wake) {
+        // Typing indicator + wake are only for the engaged branch; accumulated
+        // messages sit silently until a real trigger fires.
+        await maybeStartProgressStatus(
+          session.id,
+          event.channelType,
+          event.platformId,
+          event.threadId,
+          event.message.id,
+          getDeliveryAdapter(),
+        );
+        startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+        const freshSession = getSession(session.id);
+        if (freshSession) {
+          const endWake = startTimer('wake');
+          const woke = await withSpan(
+            'router.container.wake',
+            { 'session.id': session.id, 'agent.group.id': agent.agent_group_id },
+            async () => await wakeContainer(freshSession),
+          );
+          endWake();
+          // wakeContainer never throws — it returns false on transient spawn
+          // failure (host-sweep retries). Stop the typing indicator we just
+          // started so it doesn't leak; the inbound row stays pending.
+          if (!woke) {
+            stopTypingRefresh(freshSession.id);
+            await markProgressStatusFailed(freshSession.id, getDeliveryAdapter());
+          }
+        }
       }
-      return;
-    }
-  }
-
-  writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(event.message.id, agent.agent_group_id),
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    channelType: deliveryAddr.channelType,
-    threadId: deliveryAddr.threadId,
-    content: event.message.content,
-    trigger: wake ? 1 : 0,
-  });
-
-  log.info('Message routed', {
-    sessionId: session.id,
-    agentGroup: agent.agent_group_id,
-    engage_mode: agent.engage_mode,
-    kind: event.message.kind,
-    userId,
-    wake,
-    created,
-    agentGroupName: agentGroup.name,
-  });
-
-  if (wake) {
-    // Typing indicator + wake are only for the engaged branch; accumulated
-    // messages sit silently until a real trigger fires.
-    await maybeStartProgressStatus(
-      session.id,
-      event.channelType,
-      event.platformId,
-      event.threadId,
-      event.message.id,
-      getDeliveryAdapter(),
-    );
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
-    const freshSession = getSession(session.id);
-    if (freshSession) {
-      const endWake = startTimer('wake');
-      const woke = await wakeContainer(freshSession);
-      endWake();
-      // wakeContainer never throws — it returns false on transient spawn
-      // failure (host-sweep retries). Stop the typing indicator we just
-      // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) {
-        stopTypingRefresh(freshSession.id);
-        await markProgressStatusFailed(freshSession.id, getDeliveryAdapter());
-      }
-    }
-  }
+    },
+  );
 }
 
 /**

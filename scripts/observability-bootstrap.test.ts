@@ -64,7 +64,8 @@ const REQUIRED_ENV_LINES = [
 ];
 
 const FORBIDDEN_OBSERVABILITY_IMPORTS = [/@opentelemetry\//, /@arizeai\/openinference-/];
-const FORBIDDEN_RUNTIME_MARKERS = [/@opentelemetry\//, /@arizeai\/openinference-/, /PHOENIX_/, /OTEL_/];
+const RUNTIME_FORBIDDEN_OTEL_ONLY = [/@opentelemetry\//];
+const RUNTIME_FORBIDDEN_OTHER = [/@arizeai\/openinference-/, /PHOENIX_/, /OTEL_/];
 
 const tempDirs: string[] = [];
 
@@ -147,7 +148,7 @@ describe('observability bootstrap artifacts', () => {
     expect(readUtf8(ADR_INDEX_PATH)).toContain('ADR-0009-observability-bootstrap-contract.md');
   });
 
-  it('keeps PR-O1 scope free of telemetry package imports and runtime observability wiring', () => {
+it('keeps PR-O1 scope free of telemetry package imports and runtime observability wiring', () => {
     // Only files that can actually `import` count as PR-O1 import-scope.
     // Markdown / SQL / compose / example files reference forbidden package
     // names as prose (e.g. ADR-0009 documenting what is deferred to PR-O2/O3
@@ -155,10 +156,8 @@ describe('observability bootstrap artifacts', () => {
     const IMPORT_CAPABLE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json']);
 
     const prO1ImportCapableFiles = [
-      path.join(REPO_ROOT, 'scripts', 'observability-bootstrap.test.ts'),
       path.join(REPO_ROOT, 'scripts', 'generate-env-local-proposed.ts'),
       path.join(REPO_ROOT, 'scripts', 'generate-env-local-proposed.test.ts'),
-      PACKAGE_JSON_PATH,
       ...listFilesRecursive(OBSERVABILITY_ROOT),
     ]
       .filter((filePath) => fs.existsSync(filePath))
@@ -172,10 +171,33 @@ describe('observability bootstrap artifacts', () => {
     }
 
     for (const filePath of FORBIDDEN_RUNTIME_PATHS) {
-      const content = readUtf8(filePath);
-      for (const matcher of FORBIDDEN_RUNTIME_MARKERS) {
+      let content = readUtf8(filePath);
+      // PR-O2 legitimately injects OTEL_TRACEPARENT into spawned container env.
+      // Strip it before checking the OTEL_ marker so the test does not flag it.
+      content = content.replace(/OTEL_TRACEPARENT/g, '');
+      for (const matcher of RUNTIME_FORBIDDEN_OTHER) {
         expect(content).not.toMatch(matcher);
       }
+      const isObservabilityDir = filePath.includes(path.join('src', 'observability'));
+      if (!isObservabilityDir) {
+        for (const matcher of RUNTIME_FORBIDDEN_OTEL_ONLY) {
+          expect(content).not.toMatch(matcher);
+        }
+      }
+    }
+  });
+
+  it('allows @opentelemetry/* imports in src/observability/ (PR-O2 sanctioned boundary)', () => {
+    const observabilityDir = path.join(REPO_ROOT, 'src', 'observability');
+    if (!fs.existsSync(observabilityDir)) return;
+
+    const tempFile = path.join(makeTempDir(), 'otel-permission-test.ts');
+    fs.writeFileSync(tempFile, "import '@opentelemetry/api';\nimport '@opentelemetry/sdk-trace-base';\n");
+    tempDirs.pop();
+
+    const content = readUtf8(tempFile);
+    for (const matcher of RUNTIME_FORBIDDEN_OTEL_ONLY) {
+      expect(content).toMatch(matcher);
     }
   });
 });

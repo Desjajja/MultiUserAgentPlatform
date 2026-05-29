@@ -203,7 +203,7 @@ GRAFANA_HOST_PORT=3001
 
 | PR | 范围 | 与本 PR 的关系 |
 |---|---|---|
-| PR-O2 | host instrumentation | 复用 `PHOENIX_OTLP_ENDPOINT=http://localhost:4317`，向本栈 Phoenix 发 span |
+| PR-O2 | host instrumentation | ✅ 已交付 — host-side OTel instrumentation 已落地，消息路径 trace 在 Phoenix UI 可见；环境变量 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_SERVICE_NAME 等保持不变，向本栈 Phoenix 发 span |
 | PR-O3 | runner instrumentation | 因为 `@arizeai/openinference-instrumentation-anthropic` 不能自动 instrument `@anthropic-ai/claude-agent-sdk`，需要 manual / hybrid span（Oracle ruling）；同样发到本栈 |
 | 后续 dashboards | 完整业务视图 | 在本 PR 已就绪的 Grafana provisioning 目录下叠加；本 PR 只留占位 |
 

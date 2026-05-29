@@ -29,6 +29,9 @@ import { markProgressStatusCompleted, markProgressStatusFailed } from './modules
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
+import { withSpan } from './observability/with-span.js';
+import { clearSessionSpanContext, getSessionSpanContext } from './observability/context-bridge.js';
+import { setSpanContextWithActive, context } from './observability/trace-context.js';
 
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
@@ -165,76 +168,94 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
 }
 
 async function drainSession(session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  const parentSpanContext = getSessionSpanContext(session.id);
 
-  let outDb: Database.Database;
-  let inDb: Database.Database;
-  try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
-    inDb = openInboundDb(agentGroup.id, session.id);
-  } catch {
-    return; // DBs might not exist yet
-  }
+  const drainFn = async () => {
+    let handledOutbound = false;
+    const agentGroup = getAgentGroup(session.agent_group_id);
+    if (!agentGroup) return;
 
-  try {
-    // Read all due messages from outbound.db (read-only)
-    const allDue = getDueOutboundMessages(outDb);
-    if (allDue.length === 0) return;
+    let outDb: Database.Database;
+    let inDb: Database.Database;
+    try {
+      outDb = openOutboundDb(agentGroup.id, session.id);
+      inDb = openInboundDb(agentGroup.id, session.id);
+    } catch {
+      return; // DBs might not exist yet
+    }
 
-    // Filter out already-delivered messages using inbound.db's delivered table
-    const delivered = getDeliveredIds(inDb);
-    const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    if (undelivered.length === 0) return;
+    try {
+      // Read all due messages from outbound.db (read-only)
+      const allDue = getDueOutboundMessages(outDb);
+      if (allDue.length === 0) return;
 
-    // Ensure platform_message_id column exists (migration for existing sessions)
-    migrateDeliveredTable(inDb);
+      // Filter out already-delivered messages using inbound.db's delivered table
+      const delivered = getDeliveredIds(inDb);
+      const undelivered = allDue.filter((m) => !delivered.has(m.id));
+      if (undelivered.length === 0) return;
 
-    for (const msg of undelivered) {
-      try {
-        const platformMsgId = await deliverMessage(msg, session, inDb);
-        markDelivered(inDb, msg.id, platformMsgId ?? null);
-        deliveryAttempts.delete(msg.id);
+      // Ensure platform_message_id column exists (migration for existing sessions)
+      migrateDeliveredTable(inDb);
 
-        // Pause the typing indicator after a real user-facing message
-        // lands on the user's screen, so the client has time to visually
-        // clear the indicator before the next heartbeat tick brings it
-        // back. Skip the pause for internal traffic (system actions,
-        // agent-to-agent routing) — the user doesn't see those and
-        // shouldn't get a gap in their typing indicator for them.
-        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-          await markProgressStatusCompleted(session.id, deliveryAdapter);
-          pauseTypingRefreshAfterDelivery(session.id);
-        }
-      } catch (err) {
-        const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-        deliveryAttempts.set(msg.id, attempts);
-        if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-          log.error('Message delivery failed permanently, giving up', {
-            messageId: msg.id,
-            sessionId: session.id,
-            attempts,
-            err,
-          });
-          markDeliveryFailed(inDb, msg.id);
+      for (const msg of undelivered) {
+        try {
+          const platformMsgId = await deliverMessage(msg, session, inDb);
+          markDelivered(inDb, msg.id, platformMsgId ?? null);
+          handledOutbound = true;
           deliveryAttempts.delete(msg.id);
+
+          // Pause the typing indicator after a real user-facing message
+          // lands on the user's screen, so the client has time to visually
+          // clear the indicator before the next heartbeat tick brings it
+          // back. Skip the pause for internal traffic (system actions,
+          // agent-to-agent routing) — the user doesn't see those and
+          // shouldn't get a gap in their typing indicator for them.
           if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-            await markProgressStatusFailed(session.id, deliveryAdapter);
+            await markProgressStatusCompleted(session.id, deliveryAdapter);
+            pauseTypingRefreshAfterDelivery(session.id);
           }
-        } else {
-          log.warn('Message delivery failed, will retry', {
-            messageId: msg.id,
-            sessionId: session.id,
-            attempt: attempts,
-            maxAttempts: MAX_DELIVERY_ATTEMPTS,
-            err,
-          });
+        } catch (err) {
+          const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
+          deliveryAttempts.set(msg.id, attempts);
+          if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+            log.error('Message delivery failed permanently, giving up', {
+              messageId: msg.id,
+              sessionId: session.id,
+              attempts,
+              err,
+            });
+            markDeliveryFailed(inDb, msg.id);
+            handledOutbound = true;
+            deliveryAttempts.delete(msg.id);
+            if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+              await markProgressStatusFailed(session.id, deliveryAdapter);
+            }
+          } else {
+            log.warn('Message delivery failed, will retry', {
+              messageId: msg.id,
+              sessionId: session.id,
+              attempt: attempts,
+              maxAttempts: MAX_DELIVERY_ATTEMPTS,
+              err,
+            });
+          }
         }
       }
+    } finally {
+      outDb.close();
+      inDb.close();
+      if (handledOutbound) {
+        clearSessionSpanContext(session.id);
+      }
     }
-  } finally {
-    outDb.close();
-    inDb.close();
+  };
+
+  if (parentSpanContext) {
+    await context.with(setSpanContextWithActive(parentSpanContext), async () => {
+      await withSpan('delivery.session.drain', { 'session.id': session.id, 'agent.group.id': session.agent_group_id }, drainFn);
+    });
+  } else {
+    await withSpan('delivery.session.drain', { 'session.id': session.id, 'agent.group.id': session.agent_group_id }, drainFn);
   }
 }
 
@@ -265,180 +286,188 @@ async function deliverMessage(
   session: Session,
   inDb: Database.Database,
 ): Promise<string | undefined> {
-  if (!deliveryAdapter) {
-    log.warn('No delivery adapter configured, dropping message', { id: msg.id });
-    return;
-  }
-
-  // Observability-only rows (per-LLM-call usage telemetry from the agent
-  // runner) are not user-facing — the sidecar reads them straight from
-  // outbound.db and forwards to Langfuse. We mark them delivered so they
-  // don't loop, but skip the channel adapter entirely.
-  if (msg.kind === 'llm-usage') {
-    return undefined;
-  }
-
-  const content = JSON.parse(msg.content);
-
-  // System actions — handle internally (schedule_task, cancel_task, etc.)
-  if (msg.kind === 'system') {
-    await handleSystemAction(content, session, inDb);
-    return;
-  }
-
-  // Agent-to-agent — route to target session via the agent-to-agent module.
-  // Guarded by the channel_type check. If the module isn't installed the
-  // `agent_destinations` table won't exist and `routeAgentMessage`'s permission
-  // check will throw, which falls into the normal retry → mark-failed path.
-  if (msg.channel_type === 'agent') {
-    if (!hasTable(getDb(), 'agent_destinations')) {
-      throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
+  return withSpan('delivery.message.deliver', { 'msg.id': msg.id, 'msg.kind': msg.kind }, async () => {
+    if (!deliveryAdapter) {
+      log.warn('No delivery adapter configured, dropping message', { id: msg.id });
+      return;
     }
-    // Classification loop-close: when frontdesk delegates, the outbound
-    // should carry the classificationId from its preceding classify_intent
-    // call. Stamp outcome_ref on that row (for the regression corpus) and
-    // count any bypass (missing / stale id, action mismatch) so we can
-    // see on /metrics when the LLM skips the REQUIRED tool.
-    if (hasTable(getDb(), 'classification_log')) {
-      reconcileClassification(content, msg.id, 'agent_send', session.id);
-    }
-    const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
-    await routeAgentMessage(msg, session);
-    return;
-  }
 
-  // Permission check: the source agent must be allowed to deliver to this
-  // channel destination. Two ways it passes:
-  //
-  //   1. The target is the session's own origin chat (session.messaging_group_id
-  //      matches). An agent can always reply to the chat it was spawned from;
-  //      requiring a destinations row for the obvious case is a footgun.
-  //
-  //   2. Otherwise, the agent must have an explicit agent_destinations row
-  //      targeting that messaging group. createMessagingGroupAgent() inserts
-  //      these automatically when wiring, so an operator wiring additional
-  //      chats to the agent doesn't need a separate ACL step.
-  //
-  // Failures throw — unlike a silent `return`, an Error falls into the retry
-  // path in deliverSessionMessages and eventually marks the message as failed
-  // (instead of marking it delivered when nothing was actually delivered,
-  // which was the pre-refactor bug).
-  if (msg.channel_type && msg.platform_id) {
-    const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
-    if (!mg) {
-      throw new Error(`unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`);
+    // Observability-only rows (per-LLM-call usage telemetry from the agent
+    // runner) are not user-facing — the sidecar reads them straight from
+    // outbound.db and forwards to Langfuse. We mark them delivered so they
+    // don't loop, but skip the channel adapter entirely.
+    if (msg.kind === 'llm-usage') {
+      return undefined;
     }
-    const isOriginChat = session.messaging_group_id === mg.id;
-    // Guarded: without the agent-to-agent module, `agent_destinations`
-    // doesn't exist and we permit all non-origin channel sends (the
-    // origin-chat case is always allowed regardless). Inlined SQL instead
-    // of importing `hasDestination` so core doesn't depend on the module.
-    if (!isOriginChat && hasTable(getDb(), 'agent_destinations')) {
-      const row = getDb()
-        .prepare(
-          'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
-        )
-        .get(session.agent_group_id, 'channel', mg.id);
-      if (!row) {
-        throw new Error(
-          `unauthorized channel destination: ${session.agent_group_id} cannot send to ${mg.channel_type}/${mg.platform_id}`,
+
+    const content = JSON.parse(msg.content);
+
+    // System actions — handle internally (schedule_task, cancel_task, etc.)
+    if (msg.kind === 'system') {
+      await handleSystemAction(content, session, inDb);
+      return;
+    }
+
+    // Agent-to-agent — route to target session via the agent-to-agent module.
+    // Guarded by the channel_type check. If the module isn't installed the
+    // `agent_destinations` table won't exist and `routeAgentMessage`'s permission
+    // check will throw, which falls into the normal retry → mark-failed path.
+    if (msg.channel_type === 'agent') {
+      if (!hasTable(getDb(), 'agent_destinations')) {
+        throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
+      }
+      // Classification loop-close: when frontdesk delegates, the outbound
+      // should carry the classificationId from its preceding classify_intent
+      // call. Stamp outcome_ref on that row (for the regression corpus) and
+      // count any bypass (missing / stale id, action mismatch) so we can
+      // see on /metrics when the LLM skips the REQUIRED tool.
+      if (hasTable(getDb(), 'classification_log')) {
+        reconcileClassification(content, msg.id, 'agent_send', session.id);
+      }
+      const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
+      await routeAgentMessage(msg, session);
+      return;
+    }
+
+    // Permission check: the source agent must be allowed to deliver to this
+    // channel destination. Two ways it passes:
+    //
+    //   1. The target is the session's own origin chat (session.messaging_group_id
+    //      matches). An agent can always reply to the chat it was spawned from;
+    //      requiring a destinations row for the obvious case is a footgun.
+    //
+    //   2. Otherwise, the agent must have an explicit agent_destinations row
+    //      targeting that messaging group. createMessagingGroupAgent() inserts
+    //      these automatically when wiring, so an operator wiring additional
+    //      chats to the agent doesn't need a separate ACL step.
+    //
+    // Failures throw — unlike a silent `return`, an Error falls into the retry
+    // path in deliverSessionMessages and eventually marks the message as failed
+    // (instead of marking it delivered when nothing was actually delivered,
+    // which was the pre-refactor bug).
+    if (msg.channel_type && msg.platform_id) {
+      const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
+      if (!mg) {
+        throw new Error(`unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`);
+      }
+      const isOriginChat = session.messaging_group_id === mg.id;
+      // Guarded: without the agent-to-agent module, `agent_destinations`
+      // doesn't exist and we permit all non-origin channel sends (the
+      // origin-chat case is always allowed regardless). Inlined SQL instead
+      // of importing `hasDestination` so core doesn't depend on the module.
+      if (!isOriginChat && hasTable(getDb(), 'agent_destinations')) {
+        const row = getDb()
+          .prepare(
+            'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
+          )
+          .get(session.agent_group_id, 'channel', mg.id);
+        if (!row) {
+          throw new Error(
+            `unauthorized channel destination: ${session.agent_group_id} cannot send to ${mg.channel_type}/${mg.platform_id}`,
+          );
+        }
+      }
+    }
+
+    // Classification loop-close for clarification cards. When frontdesk
+    // says action=clarify, the card it emits via ask_user_question should
+    // carry the classificationId; reconcile here so outcome_ref gets stamped.
+    if (content.type === 'ask_question' && hasTable(getDb(), 'classification_log')) {
+      reconcileClassification(content, msg.id, 'ask_user_question', session.id);
+    }
+
+    // Track pending questions for ask_user_question flow.
+    // Guarded: without the interactive module, `pending_questions` doesn't
+    // exist and we skip persistence — the card still delivers to the user,
+    // but the response path has nowhere to land and will log unclaimed.
+    if (content.type === 'ask_question' && content.questionId && hasTable(getDb(), 'pending_questions')) {
+      const title = content.title as string | undefined;
+      const rawOptions = content.options as unknown;
+      if (!title || !Array.isArray(rawOptions)) {
+        log.error('ask_question missing required title/options — not persisting', {
+          questionId: content.questionId,
+        });
+      } else {
+        const inserted = createPendingQuestion({
+          question_id: content.questionId,
+          session_id: session.id,
+          message_out_id: msg.id,
+          platform_id: msg.platform_id,
+          channel_type: msg.channel_type,
+          thread_id: msg.thread_id,
+          title,
+          options: normalizeOptions(rawOptions as never),
+          created_at: new Date().toISOString(),
+        });
+        if (inserted) {
+          log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
+        }
+      }
+    }
+
+    // Classification loop-close for channel-delivered replies that carry
+    // a classificationId (answer_self path). Only reconcile when the
+    // outbound actually references a classification — plain replies
+    // don't need to enter the bypass accounting.
+    if (
+      typeof content._classificationId === 'string' &&
+      content._classificationId.length > 0 &&
+      hasTable(getDb(), 'classification_log')
+    ) {
+      reconcileClassification(content, msg.id, 'channel_send', session.id);
+    }
+
+    // Channel delivery
+    if (!msg.channel_type || !msg.platform_id) {
+      log.warn('Message missing routing fields', { id: msg.id });
+      return;
+    }
+
+    // Read file attachments from outbox if the content declares files.
+    // File I/O lives in session-manager.ts (symmetric with inbound
+    // extractAttachmentFiles) — delivery just hands buffers to the adapter.
+    const files =
+      Array.isArray(content.files) && content.files.length > 0
+        ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
+        : undefined;
+
+    // Defense-in-depth: scrub model reasoning tags from the user-facing text
+    // before it reaches any channel. The agent prompt also forbids them, but a
+    // misbehaving model shouldn't be able to leak `<think>` blobs to users.
+    let outboundContent = msg.content;
+    if (content && typeof content === 'object' && typeof content.text === 'string') {
+      const cleaned = stripThinkTags(content.text);
+      if (cleaned !== content.text) {
+        outboundContent = JSON.stringify({ ...content, text: cleaned });
+      }
+    }
+
+    const platformMsgId = await withSpan(
+      'delivery.channel.send',
+      { 'channel.type': msg.channel_type, 'platform.id': msg.platform_id },
+      async () => {
+        return await deliveryAdapter!.deliver(
+          msg.channel_type!,
+          msg.platform_id!,
+          msg.thread_id,
+          msg.kind,
+          outboundContent,
+          files,
         );
-      }
-    }
-  }
+      },
+    );
+    log.info('Message delivered', {
+      id: msg.id,
+      channelType: msg.channel_type,
+      platformId: msg.platform_id,
+      platformMsgId,
+      fileCount: files?.length,
+    });
 
-  // Classification loop-close for clarification cards. When frontdesk
-  // says action=clarify, the card it emits via ask_user_question should
-  // carry the classificationId; reconcile here so outcome_ref gets stamped.
-  if (content.type === 'ask_question' && hasTable(getDb(), 'classification_log')) {
-    reconcileClassification(content, msg.id, 'ask_user_question', session.id);
-  }
+    clearOutbox(session.agent_group_id, session.id, msg.id);
 
-  // Track pending questions for ask_user_question flow.
-  // Guarded: without the interactive module, `pending_questions` doesn't
-  // exist and we skip persistence — the card still delivers to the user,
-  // but the response path has nowhere to land and will log unclaimed.
-  if (content.type === 'ask_question' && content.questionId && hasTable(getDb(), 'pending_questions')) {
-    const title = content.title as string | undefined;
-    const rawOptions = content.options as unknown;
-    if (!title || !Array.isArray(rawOptions)) {
-      log.error('ask_question missing required title/options — not persisting', {
-        questionId: content.questionId,
-      });
-    } else {
-      const inserted = createPendingQuestion({
-        question_id: content.questionId,
-        session_id: session.id,
-        message_out_id: msg.id,
-        platform_id: msg.platform_id,
-        channel_type: msg.channel_type,
-        thread_id: msg.thread_id,
-        title,
-        options: normalizeOptions(rawOptions as never),
-        created_at: new Date().toISOString(),
-      });
-      if (inserted) {
-        log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
-      }
-    }
-  }
-
-  // Classification loop-close for channel-delivered replies that carry
-  // a classificationId (answer_self path). Only reconcile when the
-  // outbound actually references a classification — plain replies
-  // don't need to enter the bypass accounting.
-  if (
-    typeof content._classificationId === 'string' &&
-    content._classificationId.length > 0 &&
-    hasTable(getDb(), 'classification_log')
-  ) {
-    reconcileClassification(content, msg.id, 'channel_send', session.id);
-  }
-
-  // Channel delivery
-  if (!msg.channel_type || !msg.platform_id) {
-    log.warn('Message missing routing fields', { id: msg.id });
-    return;
-  }
-
-  // Read file attachments from outbox if the content declares files.
-  // File I/O lives in session-manager.ts (symmetric with inbound
-  // extractAttachmentFiles) — delivery just hands buffers to the adapter.
-  const files =
-    Array.isArray(content.files) && content.files.length > 0
-      ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
-      : undefined;
-
-  // Defense-in-depth: scrub model reasoning tags from the user-facing text
-  // before it reaches any channel. The agent prompt also forbids them, but a
-  // misbehaving model shouldn't be able to leak `<think>` blobs to users.
-  let outboundContent = msg.content;
-  if (content && typeof content === 'object' && typeof content.text === 'string') {
-    const cleaned = stripThinkTags(content.text);
-    if (cleaned !== content.text) {
-      outboundContent = JSON.stringify({ ...content, text: cleaned });
-    }
-  }
-
-  const platformMsgId = await deliveryAdapter.deliver(
-    msg.channel_type,
-    msg.platform_id,
-    msg.thread_id,
-    msg.kind,
-    outboundContent,
-    files,
-  );
-  log.info('Message delivered', {
-    id: msg.id,
-    channelType: msg.channel_type,
-    platformId: msg.platform_id,
-    platformMsgId,
-    fileCount: files?.length,
+    return platformMsgId;
   });
-
-  clearOutbox(session.agent_group_id, session.id, msg.id);
-
-  return platformMsgId;
 }
 
 /**
