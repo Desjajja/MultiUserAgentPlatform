@@ -31,6 +31,8 @@ import { containerExitsTotal, wakeRejectedTotal } from './metrics.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { chainAttrs } from './observability/openinference.js';
+import { getActiveSpan } from './observability/tracer.js';
 import { withSpan } from './observability/with-span.js';
 import { injectTraceContext } from './observability/trace-context.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -109,48 +111,55 @@ export function shouldAdmitWake(args: { activeCount: number; inflightCount: numb
  * sweep tick picks up the session once earlier containers have exited.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
-  return withSpan('container.wake', { 'session.id': session.id, 'agent.group.id': session.agent_group_id }, async () => {
-    if (activeContainers.has(session.id)) {
-      log.debug('Container already running', { sessionId: session.id });
-      return true;
-    }
-    const existing = wakePromises.get(session.id);
-    if (existing) {
-      log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
-      return existing;
-    }
-    const admit = shouldAdmitWake({
-      activeCount: activeContainers.size,
-      inflightCount: wakePromises.size,
-      cap: MAX_CONCURRENT_CONTAINERS,
-    });
-    if (!admit) {
-      wakeRejectedTotal.labels('capacity').inc();
-      log.warn('Wake rejected — concurrent container cap reached', {
-        sessionId: session.id,
-        agentGroupId: session.agent_group_id,
-        active: activeContainers.size,
-        inFlight: activeContainers.size + wakePromises.size,
+  return withSpan(
+    'container.wake',
+    chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
+    async () => {
+      if (activeContainers.has(session.id)) {
+        log.debug('Container already running', { sessionId: session.id });
+        return true;
+      }
+      const existing = wakePromises.get(session.id);
+      if (existing) {
+        log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
+        return existing;
+      }
+      const admit = shouldAdmitWake({
+        activeCount: activeContainers.size,
+        inflightCount: wakePromises.size,
         cap: MAX_CONCURRENT_CONTAINERS,
       });
-      return false;
-    }
-    const promise = spawnContainer(session)
-      .then(() => true)
-      .catch((err) => {
-        log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      if (!admit) {
+        wakeRejectedTotal.labels('capacity').inc();
+        log.warn('Wake rejected — concurrent container cap reached', {
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+          active: activeContainers.size,
+          inFlight: activeContainers.size + wakePromises.size,
+          cap: MAX_CONCURRENT_CONTAINERS,
+        });
         return false;
-      })
-      .finally(() => {
-        wakePromises.delete(session.id);
-      });
-    wakePromises.set(session.id, promise);
-    return promise;
-  });
+      }
+      const promise = spawnContainer(session)
+        .then(() => true)
+        .catch((err) => {
+          log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+          return false;
+        })
+        .finally(() => {
+          wakePromises.delete(session.id);
+        });
+      wakePromises.set(session.id, promise);
+      return promise;
+    },
+  );
 }
 
 async function spawnContainer(session: Session): Promise<void> {
-  return withSpan('container.spawn', { 'session.id': session.id, 'agent.group.id': session.agent_group_id, 'provider': '' }, async () => {
+  return withSpan(
+    'container.spawn',
+    chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
+    async () => {
     const agentGroup = getAgentGroup(session.agent_group_id);
     if (!agentGroup) {
       log.error('Agent group not found', { agentGroupId: session.agent_group_id });
@@ -178,6 +187,7 @@ async function spawnContainer(session: Session): Promise<void> {
     // (extra mounts, env passthrough). Computed once and threaded through both
     // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
     const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+    getActiveSpan()?.setAttribute('provider', provider);
 
     const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
     const containerName = `${PLATFORM_PROTOCOL_NAMESPACE}-v2-${agentGroup.folder}-${Date.now()}`;
@@ -247,12 +257,13 @@ async function spawnContainer(session: Session): Promise<void> {
       containerExitsTotal.labels(agentGroup.id, 'crash').inc();
       log.error('Container spawn error', { sessionId: session.id, err });
     });
-  });
+    },
+  );
 }
 
 /** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string): void {
-  withSpan('container.kill', { 'session.id': sessionId, reason }, async () => {
+export async function killContainer(sessionId: string, reason: string): Promise<void> {
+  await withSpan('container.kill', chainAttrs({ 'session.id': sessionId, reason }), async () => {
     const entry = activeContainers.get(sessionId);
     if (!entry) return;
 
