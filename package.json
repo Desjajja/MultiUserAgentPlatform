@@ -22,6 +22,7 @@
     "obs:logs": "docker compose -p muap-observability-prod -f infra/observability/docker-compose.prod.yml logs -f",
     "obs:config": "docker compose -p muap-observability-prod -f infra/observability/docker-compose.prod.yml config && docker compose -p muap-observability-sim -f infra/observability/docker-compose.sim.yml config",
     "obs:reset": "docker compose -p muap-observability-prod -f infra/observability/docker-compose.prod.yml down -v",
+    "obs:coverage": "vitest run scripts/observability-coverage.test.ts",
     "container:build": "bash container/build.sh",
     "chat": "tsx scripts/chat.ts",
     "format": "prettier --write \"src/**/*.ts\"",
