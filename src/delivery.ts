@@ -29,6 +29,7 @@ import { markProgressStatusCompleted, markProgressStatusFailed } from './modules
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
+import { chainAttrs, outputAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
 import { clearSessionSpanContext, getSessionSpanContext } from './observability/context-bridge.js';
 import { setSpanContextWithActive, context } from './observability/trace-context.js';
@@ -169,31 +170,37 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
 
 async function drainSession(session: Session): Promise<void> {
   const parentSpanContext = getSessionSpanContext(session.id);
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) return;
+
+  let outDb: Database.Database;
+  let inDb: Database.Database;
+  try {
+    outDb = openOutboundDb(agentGroup.id, session.id);
+    inDb = openInboundDb(agentGroup.id, session.id);
+  } catch {
+    return; // DBs might not exist yet
+  }
+
+  const allDue = getDueOutboundMessages(outDb);
+  if (allDue.length === 0) {
+    outDb.close();
+    inDb.close();
+    return;
+  }
+
+  const delivered = getDeliveredIds(inDb);
+  const undelivered = allDue.filter((m) => !delivered.has(m.id));
+  if (undelivered.length === 0) {
+    outDb.close();
+    inDb.close();
+    return;
+  }
 
   const drainFn = async () => {
     let handledOutbound = false;
-    const agentGroup = getAgentGroup(session.agent_group_id);
-    if (!agentGroup) return;
-
-    let outDb: Database.Database;
-    let inDb: Database.Database;
-    try {
-      outDb = openOutboundDb(agentGroup.id, session.id);
-      inDb = openInboundDb(agentGroup.id, session.id);
-    } catch {
-      return; // DBs might not exist yet
-    }
 
     try {
-      // Read all due messages from outbound.db (read-only)
-      const allDue = getDueOutboundMessages(outDb);
-      if (allDue.length === 0) return;
-
-      // Filter out already-delivered messages using inbound.db's delivered table
-      const delivered = getDeliveredIds(inDb);
-      const undelivered = allDue.filter((m) => !delivered.has(m.id));
-      if (undelivered.length === 0) return;
-
       // Ensure platform_message_id column exists (migration for existing sessions)
       migrateDeliveredTable(inDb);
 
@@ -250,12 +257,18 @@ async function drainSession(session: Session): Promise<void> {
     }
   };
 
+  const spanAttrs = chainAttrs({
+    'session.id': session.id,
+    'agent.group.id': session.agent_group_id,
+    'message.count': undelivered.length,
+  });
+
   if (parentSpanContext) {
     await context.with(setSpanContextWithActive(parentSpanContext), async () => {
-      await withSpan('delivery.session.drain', { 'session.id': session.id, 'agent.group.id': session.agent_group_id }, drainFn);
+      await withSpan('delivery.session.drain', spanAttrs, drainFn);
     });
   } else {
-    await withSpan('delivery.session.drain', { 'session.id': session.id, 'agent.group.id': session.agent_group_id }, drainFn);
+    await withSpan('delivery.session.drain', spanAttrs, drainFn);
   }
 }
 
@@ -286,7 +299,10 @@ async function deliverMessage(
   session: Session,
   inDb: Database.Database,
 ): Promise<string | undefined> {
-  return withSpan('delivery.message.deliver', { 'msg.id': msg.id, 'msg.kind': msg.kind }, async () => {
+  return withSpan(
+    'delivery.message.deliver',
+    chainAttrs({ 'msg.id': msg.id, 'message.kind': msg.kind }),
+    async () => {
     if (!deliveryAdapter) {
       log.warn('No delivery adapter configured, dropping message', { id: msg.id });
       return;
@@ -444,7 +460,11 @@ async function deliverMessage(
 
     const platformMsgId = await withSpan(
       'delivery.channel.send',
-      { 'channel.type': msg.channel_type, 'platform.id': msg.platform_id },
+      chainAttrs({
+        'channel.type': msg.channel_type,
+        'platform.id': msg.platform_id,
+        ...outputAttrs(outboundContent),
+      }),
       async () => {
         return await deliveryAdapter!.deliver(
           msg.channel_type!,
@@ -467,7 +487,8 @@ async function deliverMessage(
     clearOutbox(session.agent_group_id, session.id, msg.id);
 
     return platformMsgId;
-  });
+    },
+  );
 }
 
 /**
