@@ -18,7 +18,7 @@
  * for policy refusals.
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
-import { chainAttrs, runInDetachedRoot } from './observability/openinference.js';
+import { chainAttrs, inputAttrsForText, runInDetachedRoot } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
 import { storeSessionSpanContext } from './observability/context-bridge.js';
 import { gateCommand } from './command-gate.js';
@@ -497,7 +497,11 @@ async function deliverToAgent(
 ): Promise<void> {
   await withSpan(
     'router.deliver_to_agent',
-    { 'agent.group.id': agent.agent_group_id },
+    chainAttrs({
+      'agent.group.id': agent.agent_group_id,
+      ...(userId ? { 'user.id': userId } : {}),
+      ...inputAttrsForText(event.message.content),
+    }),
     async () => {
       if (isUserScopedSessionMode(effectiveSessionMode) && !userId) {
         throw new Error(`userId is required for session_mode=${effectiveSessionMode}`);
@@ -513,6 +517,7 @@ async function deliverToAgent(
 
       const span = getActiveSpan();
       if (span) {
+        span.setAttribute('session.id', session.id);
         storeSessionSpanContext(session.id, span.spanContext());
       }
 
@@ -595,11 +600,7 @@ async function deliverToAgent(
         const freshSession = getSession(session.id);
         if (freshSession) {
           const endWake = startTimer('wake');
-          const woke = await withSpan(
-            'router.container.wake',
-            { 'session.id': session.id, 'agent.group.id': agent.agent_group_id },
-            async () => await wakeContainer(freshSession),
-          );
+          const woke = await wakeContainer(freshSession);
           endWake();
           // wakeContainer never throws — it returns false on transient spawn
           // failure (host-sweep retries). Stop the typing indicator we just
