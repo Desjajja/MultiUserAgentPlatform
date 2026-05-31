@@ -118,13 +118,14 @@ const SCHEMA_PATH_SEGMENTS = ['docs', 'observability-span-schema.md'] as const;
 const HOST_SOURCE_SEGMENTS = ['src'] as const;
 const RUNNER_SOURCE_SEGMENTS = ['container', 'agent-runner', 'src'] as const;
 
-const WITH_SPAN_PATTERN = /withSpan\(\s*['"]([^'"]+)['"]/g;
+const WITH_SPAN_PATTERN = /(?:withSpan|startActiveSpan)\(\s*['"]([^'"]+)['"]/g;
 const NAMESPACE_ROW_PATTERN = /^\| `([a-z_]+)\.\*` \|/gm;
 const DEPRECATED_ATTR_PATTERN = /['"]msg\.kind['"]/g;
 
 const REQUIRED_KIND_MARKERS = [
   'openinference.span.kind',
   'chainAttrs(',
+  'agentAttrs(',
   'rootInputAttrs(',
   'outputAttrs(',
   '[SemanticConventions.OPENINFERENCE_SPAN_KIND]',
@@ -468,6 +469,7 @@ function collectDeprecatedAttributeOccurrences(repoRoot: string, filePath: strin
 function detectAttrCoverage(name: string, callSlice: string, fullSource: string, callStartIndex: number): AttrCoverage {
   const notes: string[] = [];
   const hasChainAttrs = callSlice.includes('chainAttrs(');
+  const hasAgentAttrs = callSlice.includes('agentAttrs(');
   const hasRootInputAttrs = callSlice.includes('rootInputAttrs(');
   const hasOutputAttrs = callSlice.includes('outputAttrs(');
   const hasLiteralKind = callSlice.includes('openinference.span.kind');
@@ -475,6 +477,7 @@ function detectAttrCoverage(name: string, callSlice: string, fullSource: string,
   const attrsBinding = resolveNearbyAttrsBinding(callSlice, fullSource, callStartIndex);
   const bindingSlice = attrsBinding?.valueSlice ?? '';
   const hasBoundChainAttrs = bindingSlice.includes('chainAttrs(');
+  const hasBoundAgentAttrs = bindingSlice.includes('agentAttrs(');
   const hasBoundRootInputAttrs = bindingSlice.includes('rootInputAttrs(');
   const hasBoundOutputAttrs = bindingSlice.includes('outputAttrs(');
   const hasBoundLiteralKind = bindingSlice.includes('openinference.span.kind');
@@ -484,10 +487,12 @@ function detectAttrCoverage(name: string, callSlice: string, fullSource: string,
   if (
     hasLiteralKind ||
     hasChainAttrs ||
+    hasAgentAttrs ||
     hasRootInputAttrs ||
     hasOutputAttrs ||
     hasSemanticConventionKind ||
     hasBoundChainAttrs ||
+    hasBoundAgentAttrs ||
     hasBoundRootInputAttrs ||
     hasBoundOutputAttrs ||
     hasBoundLiteralKind ||
@@ -497,11 +502,12 @@ function detectAttrCoverage(name: string, callSlice: string, fullSource: string,
   }
 
   if (hasChainAttrs) notes.push('kind via chainAttrs()');
+  if (hasAgentAttrs) notes.push('kind via agentAttrs()');
   if (hasRootInputAttrs) notes.push('rootInputAttrs() provides root input coverage');
   if (hasOutputAttrs) notes.push('outputAttrs() provides output coverage');
   if (hasLiteralKind) notes.push('literal openinference.span.kind key present');
   if (hasSemanticConventionKind) notes.push('SemanticConventions.OPENINFERENCE_SPAN_KIND key present');
-  if (attrsBinding && (hasBoundChainAttrs || hasBoundRootInputAttrs || hasBoundOutputAttrs || hasBoundLiteralKind)) {
+  if (attrsBinding && (hasBoundChainAttrs || hasBoundAgentAttrs || hasBoundRootInputAttrs || hasBoundOutputAttrs || hasBoundLiteralKind)) {
     notes.push(`attrs via nearby binding ${attrsBinding.name}`);
   }
 
@@ -553,7 +559,7 @@ function resolveNearbyAttrsBinding(
   callStartIndex: number,
 ): { name: string; valueSlice: string } | null {
   const identifierMatch = callSlice.match(
-    /withSpan\(\s*['"][^'"]+['"]\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:,|\))/,
+    /(?:withSpan|startActiveSpan)\(\s*['"][^'"]+['"]\s*,\s*(?:\{[^}]*\}\s*,\s*)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:,|\))/,
   );
   if (!identifierMatch) return null;
 

@@ -81,7 +81,7 @@ describe('openinference helper', () => {
     });
 
     expect(shortAttrs[SemanticConventions.OPENINFERENCE_SPAN_KIND]).toBe(
-      OpenInferenceSpanKind.CHAIN,
+      OpenInferenceSpanKind.AGENT,
     );
     expect(shortAttrs[SemanticConventions.SESSION_ID]).toBe('sess-42');
     expect(shortAttrs[SemanticConventions.USER_ID]).toBe('user-7');

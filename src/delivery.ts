@@ -31,7 +31,8 @@ import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 import { chainAttrs, outputAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
-import { clearSessionSpanContext, getSessionSpanContext } from './observability/context-bridge.js';
+import { getActiveSpan } from './observability/tracer.js';
+import { clearSessionSpanContext, getSessionSpanContext, endSessionRootSpan } from './observability/context-bridge.js';
 import { setSpanContextWithActive, context } from './observability/trace-context.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -199,6 +200,7 @@ async function drainSession(session: Session): Promise<void> {
 
   const drainFn = async () => {
     let handledOutbound = false;
+    let lastDeliveredText: string | undefined;
 
     try {
       // Ensure platform_message_id column exists (migration for existing sessions)
@@ -206,17 +208,30 @@ async function drainSession(session: Session): Promise<void> {
 
       for (const msg of undelivered) {
         try {
+          if (msg.kind === 'llm-usage') {
+            const drainSpan = getActiveSpan();
+            drainSpan?.addEvent('llm-usage.skipped', { 'msg.id': msg.id });
+            markDelivered(inDb, msg.id, null);
+            handledOutbound = true;
+            deliveryAttempts.delete(msg.id);
+            continue;
+          }
           const platformMsgId = await deliverMessage(msg, session, inDb);
           markDelivered(inDb, msg.id, platformMsgId ?? null);
           handledOutbound = true;
           deliveryAttempts.delete(msg.id);
 
-          // Pause the typing indicator after a real user-facing message
-          // lands on the user's screen, so the client has time to visually
-          // clear the indicator before the next heartbeat tick brings it
-          // back. Skip the pause for internal traffic (system actions,
-          // agent-to-agent routing) — the user doesn't see those and
-          // shouldn't get a gap in their typing indicator for them.
+          if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+            try {
+              const parsed = JSON.parse(msg.content);
+              if (typeof parsed.text === 'string') {
+                lastDeliveredText = parsed.text;
+              }
+            } catch {
+              lastDeliveredText = msg.content;
+            }
+          }
+
           if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
             await markProgressStatusCompleted(session.id, deliveryAdapter);
             pauseTypingRefreshAfterDelivery(session.id);
@@ -252,6 +267,7 @@ async function drainSession(session: Session): Promise<void> {
       outDb.close();
       inDb.close();
       if (handledOutbound) {
+        endSessionRootSpan(session.id, lastDeliveredText);
         clearSessionSpanContext(session.id);
       }
     }
@@ -306,14 +322,6 @@ async function deliverMessage(
     if (!deliveryAdapter) {
       log.warn('No delivery adapter configured, dropping message', { id: msg.id });
       return;
-    }
-
-    // Observability-only rows (per-LLM-call usage telemetry from the agent
-    // runner) are not user-facing — the sidecar reads them straight from
-    // outbound.db and forwards to Langfuse. We mark them delivered so they
-    // don't loop, but skip the channel adapter entirely.
-    if (msg.kind === 'llm-usage') {
-      return undefined;
     }
 
     const content = JSON.parse(msg.content);
@@ -463,7 +471,7 @@ async function deliverMessage(
       chainAttrs({
         'channel.type': msg.channel_type,
         'platform.id': msg.platform_id,
-        ...outputAttrs(outboundContent),
+        ...outputAttrs(typeof content === 'object' && typeof content.text === 'string' ? content.text : outboundContent),
       }),
       async () => {
         return await deliveryAdapter!.deliver(

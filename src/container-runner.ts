@@ -35,6 +35,7 @@ import { chainAttrs } from './observability/openinference.js';
 import { getActiveSpan } from './observability/tracer.js';
 import { withSpan } from './observability/with-span.js';
 import { injectTraceContext } from './observability/trace-context.js';
+import { failSessionRootSpan } from './observability/context-bridge.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -246,6 +247,9 @@ async function spawnContainer(session: Session): Promise<void> {
       markContainerStopped(session.id);
       stopTypingRefresh(session.id);
       containerExitsTotal.labels(agentGroup.id, outcome).inc();
+      if (outcome === 'crash' || outcome === 'killed') {
+        failSessionRootSpan(session.id, `container ${outcome} (code=${code})`);
+      }
       log.info('Container exited', { sessionId: session.id, code, containerName, outcome });
     });
 
@@ -255,6 +259,7 @@ async function spawnContainer(session: Session): Promise<void> {
       markContainerStopped(session.id);
       stopTypingRefresh(session.id);
       containerExitsTotal.labels(agentGroup.id, 'crash').inc();
+      failSessionRootSpan(session.id, `container spawn error: ${err.message}`);
       log.error('Container spawn error', { sessionId: session.id, err });
     });
     },

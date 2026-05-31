@@ -87,12 +87,21 @@ export function chainAttrs(attrs: Record<string, unknown> = {}): Record<string, 
   };
 }
 
+export function agentAttrs(attrs: Record<string, unknown> = {}): Record<string, unknown> {
+  const filteredAttrs = Object.fromEntries(Object.entries(attrs).filter(([, value]) => value !== undefined));
+
+  return {
+    [SemanticConventions.OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
+    ...filteredAttrs,
+  };
+}
+
 export function rootInputAttrs(opts: {
   sessionId: string;
   userId?: string | null;
   inputValue: string;
 }): Record<string, unknown> {
-  return chainAttrs({
+  return agentAttrs({
     'session.id': opts.sessionId,
     ...(opts.userId ? { 'user.id': opts.userId } : {}),
     ...inputAttrsForText(opts.inputValue),

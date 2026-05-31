@@ -148,7 +148,7 @@ describe('observability coverage gate', () => {
     const repoRoot = makeFixtureRepo({
       baselineSource: `
 import { withSpan } from './with-span.js';
-import { chainAttrs } from './openinference.js';
+import { chainAttrs, agentAttrs } from './openinference.js';
 
 export async function runCoverageFixture(): Promise<void> {
   const spanAttrs = chainAttrs({ 'session.id': 'sess-1', 'message.count': 1 });
@@ -167,7 +167,7 @@ export async function runCoverageFixture(): Promise<void> {
 
   await withSpan(
     'router.deliver_to_agent',
-    chainAttrs({ 'session.id': 'sess-1', 'user.id': 'user-1', 'input.value': 'hello', 'input.mime_type': 'text/plain' }),
+    agentAttrs({ 'session.id': 'sess-1', 'user.id': 'user-1', 'input.value': 'hello', 'input.mime_type': 'text/plain' }),
     async () => {},
   );
 
