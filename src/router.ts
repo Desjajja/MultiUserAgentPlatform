@@ -21,6 +21,8 @@ import { getChannelAdapter } from './channels/channel-registry.js';
 import { SpanStatusCode } from '@opentelemetry/api';
 import { chainAttrs, runInDetachedRoot, rootInputAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
+import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
+import { getActiveSpan } from './observability/tracer.js';
 import { storeSessionSpanContext, storeSessionRootSpan, failSessionRootSpan } from './observability/context-bridge.js';
 import { gateCommand } from './command-gate.js';
 import { getTracer } from './observability/tracer.js';
@@ -175,6 +177,12 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       'router.route',
       chainAttrs({ 'channel.type': event.channelType || 'unknown' }),
       async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.ROUTE_TYPE]: 'frontdesk',
+          [BusinessTagKeys.LANE]: 'frontdesk',
+          [BusinessTagKeys.CHANNEL]: event.channelType || 'unknown',
+        });
         const endTimer = startTimer('route');
         try {
           await routeInboundInner(event);
@@ -502,15 +510,22 @@ async function deliverToAgent(
   await runInDetachedRoot(() => {
     const tracer = getTracer();
 
-    return tracer.startActiveSpan(
-      'router.deliver_to_agent',
-      { attributes: rootInputAttrs({
-        sessionId: '',
-        userId: userId ?? undefined,
-        inputValue: inputText,
-      }) as import('@opentelemetry/api').Attributes },
-      async (rootSpan) => {
-        try {
+      return tracer.startActiveSpan(
+        'router.deliver_to_agent',
+        { attributes: rootInputAttrs({
+          sessionId: '',
+          userId: userId ?? undefined,
+          inputValue: inputText,
+        }) as import('@opentelemetry/api').Attributes },
+        async (rootSpan) => {
+          try {
+            applyBusinessTags(rootSpan, {
+              [BusinessTagKeys.LAYER]: 'ai',
+              [BusinessTagKeys.ROUTE_TYPE]: 'frontdesk',
+              [BusinessTagKeys.LANE]: 'frontdesk',
+              [BusinessTagKeys.CHANNEL]: event.channelType || 'unknown',
+              [BusinessTagKeys.INTENT]: 'chat',
+            });
           if (isUserScopedSessionMode(effectiveSessionMode) && !userId) {
             throw new Error(`userId is required for session_mode=${effectiveSessionMode}`);
           }
@@ -525,6 +540,9 @@ async function deliverToAgent(
 
           rootSpan.setAttribute('session.id', session.id);
           rootSpan.setAttribute('agent.group.id', agent.agent_group_id);
+          rootSpan.setAttribute('muap.agent_group', agentGroup.name);
+          rootSpan.setAttribute('muap.session_mode', effectiveSessionMode);
+          rootSpan.setAttribute('muap.engage_mode', (session.spawn_depth ?? 0) > 0 ? 'a2a' : 'direct');
           storeSessionSpanContext(session.id, rootSpan.spanContext());
 
           const deliveryAddr = event.replyTo ?? {

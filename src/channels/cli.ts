@@ -41,6 +41,8 @@ import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
 import { chainAttrs, runInDetachedRoot } from '../observability/openinference.js';
 import { withSpan } from '../observability/with-span.js';
+import { BusinessTagKeys, applyBusinessTags } from '../observability/business-tags.js';
+import { getActiveSpan } from '../observability/tracer.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -183,6 +185,10 @@ function createAdapter(): ChannelAdapter {
   async function handleLine(line: string, config: ChannelSetup, claimChatSlot: () => void): Promise<void> {
     return runInDetachedRoot(() =>
       withSpan('channel.cli.receive', chainAttrs({ 'channel.type': 'cli' }), async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.CHANNEL]: 'cli',
+        });
         let payload: {
           text?: unknown;
           to?: unknown;

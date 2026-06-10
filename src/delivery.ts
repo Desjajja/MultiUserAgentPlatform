@@ -31,6 +31,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 import { chainAttrs, outputAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
+import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
 import { getActiveSpan } from './observability/tracer.js';
 import { clearSessionSpanContext, getSessionSpanContext, endSessionRootSpan } from './observability/context-bridge.js';
 import { setSpanContextWithActive, context } from './observability/trace-context.js';
@@ -209,8 +210,6 @@ async function drainSession(session: Session): Promise<void> {
       for (const msg of undelivered) {
         try {
           if (msg.kind === 'llm-usage') {
-            const drainSpan = getActiveSpan();
-            drainSpan?.addEvent('llm-usage.skipped', { 'msg.id': msg.id });
             markDelivered(inDb, msg.id, null);
             handledOutbound = true;
             deliveryAttempts.delete(msg.id);
@@ -281,10 +280,22 @@ async function drainSession(session: Session): Promise<void> {
 
   if (parentSpanContext) {
     await context.with(setSpanContextWithActive(parentSpanContext), async () => {
-      await withSpan('delivery.session.drain', spanAttrs, drainFn);
+      await withSpan('delivery.session.drain', spanAttrs, async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        });
+        await drainFn();
+      });
     });
   } else {
-    await withSpan('delivery.session.drain', spanAttrs, drainFn);
+    await withSpan('delivery.session.drain', spanAttrs, async () => {
+      applyBusinessTags(getActiveSpan(), {
+        [BusinessTagKeys.LAYER]: 'platform',
+        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+      });
+      await drainFn();
+    });
   }
 }
 
@@ -319,6 +330,10 @@ async function deliverMessage(
     'delivery.message.deliver',
     chainAttrs({ 'msg.id': msg.id, 'message.kind': msg.kind }),
     async () => {
+      applyBusinessTags(getActiveSpan(), {
+        [BusinessTagKeys.LAYER]: 'platform',
+        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+      });
     if (!deliveryAdapter) {
       log.warn('No delivery adapter configured, dropping message', { id: msg.id });
       return;
@@ -474,6 +489,10 @@ async function deliverMessage(
         ...outputAttrs(typeof content === 'object' && typeof content.text === 'string' ? content.text : outboundContent),
       }),
       async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        });
         return await deliveryAdapter!.deliver(
           msg.channel_type!,
           msg.platform_id!,

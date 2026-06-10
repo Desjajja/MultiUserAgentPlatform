@@ -26,6 +26,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { startAgentTurn } from './observability/turn-span.js';
 import { clearRequestIdentity, getRequestIdentity, setRequestIdentity } from './request-context.js';
 import { resolveBatchIdentity, splitBatchByTurn } from './request-identity.js';
 
@@ -148,11 +149,13 @@ export interface PollLoopConfig {
    */
   providerName: string;
   cwd: string;
+  sessionId: string;
+  agentGroupId: string;
   systemContext?: {
     instructions?: string;
   };
   /**
-   * Idle exit window in milliseconds. When > 0, the loop exits cleanly
+   * Idle exit window in milliseconds. When > 0, the poll loop exits cleanly
    * (process.exit 0) once this many ms has elapsed without a
    * trigger-eligible pending batch — freeing container memory for other
    * sessions. When 0, the loop stays alive indefinitely (legacy behavior)
@@ -356,20 +359,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // batch — not from "the latest inbound row at call time" — to avoid
     // cross-user misattribution in group/shared sessions.
     setRequestIdentity(resolveBatchIdentity(keep));
+    const turnSpan = startAgentTurn({
+      sessionId: config.sessionId,
+      agentGroupId: config.agentGroupId,
+      provider: config.providerName,
+    });
     try {
-      const result = await processQuery(query, turnRouting, processingIds, config.providerName);
+      const result = await processQuery(query, turnRouting, processingIds, config.providerName, {
+        onInitialTurnCompleted: () => turnSpan.complete(),
+      });
+      if (!result.initialTurnCompleted) {
+        turnSpan.complete();
+      }
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
     } catch (err) {
+      turnSpan.fail(err);
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
 
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
       // it so the next attempt starts fresh.
-      const sessionInvalid = continuation && config.provider.isSessionInvalid(err);
+      const sessionInvalid = continuation ? config.provider.isSessionInvalid(err) : false;
       if (sessionInvalid) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
@@ -452,6 +466,11 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  initialTurnCompleted: boolean;
+}
+
+interface ProcessQueryHooks {
+  onInitialTurnCompleted?: () => void;
 }
 
 async function processQuery(
@@ -459,9 +478,17 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  hooks: ProcessQueryHooks = {},
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  let initialTurnCompleted = false;
+
+  const completeInitialTurn = (): void => {
+    if (initialTurnCompleted) return;
+    initialTurnCompleted = true;
+    hooks.onInitialTurnCompleted?.();
+  };
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -606,10 +633,13 @@ async function processQuery(
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
-        markCompleted(initialBatchIds);
+        if (!initialTurnCompleted) {
+          markCompleted(initialBatchIds);
+        }
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
+        completeInitialTurn();
       } else if (event.type === 'compacted') {
         // The SDK auto-compacted the conversation. After compaction the
         // model often drops the learned `<message to="…">` wrapping
@@ -628,26 +658,7 @@ async function processQuery(
           );
         }
       } else if (event.type === 'usage') {
-        // Per-LLM-call cost/latency record. Persisted as a sentinel row in
-        // outbound.db with kind='llm-usage' so host-side observability can
-        // attribute spend to the originating turn without instrumenting
-        // each provider individually. Not user-facing — the host router
-        // filters these out before delivery.
-        writeMessageOut({
-          id: generateId(),
-          kind: 'llm-usage',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({
-            model: event.model,
-            inputTokens: event.inputTokens,
-            outputTokens: event.outputTokens,
-            totalTokens: event.totalTokens,
-            durationMs: event.durationMs,
-            transport: event.transport,
-          }),
-        });
+        // No-op: LiteLLM Proxy captures usage via GenAI spans (ADR-0016)
       }
     }
   } finally {
@@ -655,7 +666,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, initialTurnCompleted };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {

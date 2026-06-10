@@ -146,6 +146,12 @@ export interface ContainerConfig {
    * usually leave this off — their prompt is already small.
    */
   progressiveDisclosure?: boolean | 'lean';
+  /**
+   * Idle exit window in milliseconds. When > 0, the container poll loop exits
+   * cleanly after this long without trigger-eligible work. Read by the
+   * agent-runner; 0 keeps legacy behavior (host-sweep 30 min ceiling).
+   */
+  idleExitMs?: number;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -163,6 +169,11 @@ function normalizeMemoryMode(value: unknown): MemoryMode | undefined {
 
 function normalizeA2aSessionMode(value: unknown): A2aSessionMode | undefined {
   return value === 'agent-shared' || value === 'root-session' ? value : undefined;
+}
+
+function normalizeIdleExitMs(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.floor(value);
 }
 
 function normalizeResources(value: unknown): ContainerResourceLimits | undefined {
@@ -215,6 +226,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
       resources: normalizeResources(raw.resources),
       env: raw.env,
+      idleExitMs: normalizeIdleExitMs(raw.idleExitMs),
       progressiveDisclosure:
         raw.progressiveDisclosure === 'lean'
           ? 'lean'

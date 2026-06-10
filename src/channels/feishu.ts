@@ -18,6 +18,8 @@ import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { chainAttrs, runInDetachedRoot } from '../observability/openinference.js';
 import { withSpan } from '../observability/with-span.js';
+import { BusinessTagKeys, applyBusinessTags } from '../observability/business-tags.js';
+import { getActiveSpan } from '../observability/tracer.js';
 import { inboundTotal } from '../metrics.js';
 import { registerWebhookHandler } from '../webhook-server.js';
 import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
@@ -424,6 +426,10 @@ function createAdapter(config: FeishuConfig): ChannelAdapter {
 
     return runInDetachedRoot(() =>
       withSpan('channel.feishu.receive', chainAttrs(spanAttributes), async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.CHANNEL]: 'feishu',
+        });
         if (config.botOpenId && senderId === config.botOpenId) return;
 
         const platformId = normalizeFeishuPlatformId({

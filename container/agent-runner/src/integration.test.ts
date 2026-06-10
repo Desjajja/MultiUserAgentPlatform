@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { NodeTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
@@ -349,7 +350,42 @@ describe('poll loop integration', () => {
 
     await loopPromise.catch(() => {});
   });
+
+  it('exports agent.turn after the first result even if the provider stream stays open', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'trace this turn' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
+
+    const exporter = new CapturingSpanExporter();
+    const tracerProvider = new NodeTracerProvider();
+    tracerProvider.addSpanProcessor(new SimpleSpanProcessor(exporter as never));
+    tracerProvider.register();
+
+    const provider = new ResultThenWaitProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2500);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2500);
+    await waitFor(() => exporter.spans.some((span) => span.name === 'agent.turn'), 500);
+
+    provider.abortActiveQuery();
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(exporter.spans.some((span) => span.name === 'agent.turn')).toBe(true);
+  });
 });
+
+class CapturingSpanExporter {
+  readonly spans: Array<{ name: string }> = [];
+
+  export(spans: Array<{ name: string }>, resultCallback: (result: { code: number }) => void): void {
+    this.spans.push(...spans);
+    resultCallback({ code: 0 });
+  }
+
+  async shutdown(): Promise<void> {}
+
+  async forceFlush(): Promise<void> {}
+}
 
 /**
  * Provider that emits a single compacted event mid-stream, then returns a
@@ -411,6 +447,67 @@ class CompactingProvider {
   }
 }
 
+/**
+ * Provider that emits one result and then keeps its async iterator open until
+ * the test aborts it. This matches the long-lived provider-session shape that
+ * previously prevented agent.turn from ever ending.
+ */
+class ResultThenWaitProvider {
+  readonly supportsNativeSlashCommands = false;
+
+  private resolveWaiter: (() => void) | null = null;
+  private activeQueryAbort: (() => void) | null = null;
+
+  isSessionInvalid(): boolean {
+    return false;
+  }
+
+  abortActiveQuery(): void {
+    this.activeQueryAbort?.();
+  }
+
+  query(_input: { prompt: string; cwd: string }) {
+    let ended = false;
+    let aborted = false;
+
+    const wake = () => this.resolveWaiter?.();
+    this.activeQueryAbort = () => {
+      aborted = true;
+      wake();
+    };
+
+    async function* events(this: ResultThenWaitProvider) {
+      yield { type: 'activity' as const };
+      yield { type: 'init' as const, continuation: 'result-then-wait-session' };
+      yield { type: 'activity' as const };
+      yield { type: 'result' as const, text: '<message to="discord-test">ack</message>' };
+
+      while (!ended && !aborted) {
+        await new Promise<void>((resolve) => {
+          this.resolveWaiter = resolve;
+          setTimeout(resolve, 50);
+        });
+        this.resolveWaiter = null;
+      }
+    }
+
+    return {
+      push() {
+        wake();
+      },
+      end() {
+        ended = true;
+        wake();
+      },
+      abort() {
+        aborted = true;
+        wake();
+      },
+      events: events.call(this),
+    };
+  }
+}
+
 // Helper: run poll loop until aborted or timeout
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
@@ -418,6 +515,8 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
       provider,
       providerName: 'mock',
       cwd: '/tmp',
+      sessionId: 'sess-test',
+      agentGroupId: 'agent-test',
     }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));

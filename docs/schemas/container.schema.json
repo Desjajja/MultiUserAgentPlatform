@@ -1,0 +1,255 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://frontlane.dev/schemas/container.json",
+  "title": "FrontLane Agent Group Container Config",
+  "description": "Per-agent-group configuration at groups/<folder>/container.json. Generated from src/container-config.ts — run pnpm generate:container-schema to refresh.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mcpServers",
+    "packages",
+    "additionalMounts",
+    "skills"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference for editor validation (not read by runtime)."
+    },
+    "a2aSessionMode": {
+      "$ref": "#/$defs/A2aSessionMode",
+      "description": "Agent-to-agent worker session policy.\n- `agent-shared`: one shared a2a session per target agent group\n- `root-session`: one a2a session per target agent group and root session"
+    },
+    "additionalMounts": {
+      "items": {
+        "$ref": "#/$defs/AdditionalMountConfig"
+      },
+      "type": "array"
+    },
+    "agentGroupId": {
+      "description": "Agent group ID — set by the host, read by the runner.",
+      "type": "string"
+    },
+    "assistantName": {
+      "description": "Assistant display name (used in system prompt / responses).",
+      "type": "string"
+    },
+    "enterpriseGateway": {
+      "$ref": "#/$defs/EnterpriseGatewayConfig"
+    },
+    "env": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Optional env vars forwarded into the container at spawn time. Use this to point a skill's bridge.py at a non-default backend (e.g. `CAMERA_BASE_URL=http://172.18.198.229:8001`) without rebuilding the image or hard-coding hostnames in skill code. Keys/values passed verbatim via `docker run -e KEY=VALUE`. Provider/system env (TZ, OneCLI HTTPS_PROXY, etc.) is layered separately and is not overridden by this map.",
+      "type": "object"
+    },
+    "groupName": {
+      "description": "Agent group display name (used in transcript archiving).",
+      "type": "string"
+    },
+    "idleExitMs": {
+      "description": "Idle exit window in milliseconds. When > 0, the container poll loop exits cleanly after this long without trigger-eligible work. Read by the agent-runner; 0 keeps legacy behavior (host-sweep 30 min ceiling).",
+      "type": "number"
+    },
+    "imageTag": {
+      "type": "string"
+    },
+    "maxMessagesPerPrompt": {
+      "description": "Max messages per prompt. Falls back to code default if unset.",
+      "type": "number"
+    },
+    "mcpServers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/McpServerConfig"
+      },
+      "type": "object"
+    },
+    "memoryMode": {
+      "$ref": "#/$defs/MemoryMode",
+      "description": "Long-lived memory policy for this agent group.\n- `workspace`: agent may persist durable notes in its shared workspace\n- `erp`: durable user/business memory must go through the ERP gateway"
+    },
+    "packages": {
+      "additionalProperties": false,
+      "properties": {
+        "apt": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "npm": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "apt",
+        "npm"
+      ],
+      "type": "object"
+    },
+    "progressiveDisclosure": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "const": "lean",
+          "type": "string"
+        }
+      ],
+      "description": "Progressive skill disclosure (perf). Replaces each skill's full `instructions.md` content in the composed system prompt to keep the prompt small and prefix-cache friendly.\n\n  false (default)  — current behavior: every skill's instructions.md                      is inlined into the system prompt.   true             — emit a compact `Available Skills` index                      (name + description from SKILL.md frontmatter) +                      anti-overthink preamble telling the agent to                      skip `load_skill` for simple greetings. Use                      `load_skill(name)` MCP tool to fetch a skill on                      demand.   \"lean\"           — omit the skill index entirely. For dispatcher                      agents that route to worker agents and never                      need to execute skills themselves                      (`frontlane-frontdesk` pattern). The                      `load_skill` tool stays registered but the                      agent has no list to choose from.\n\nWorker agent groups that already specify a narrow `skills` array usually leave this off — their prompt is already small."
+    },
+    "provider": {
+      "description": "Agent provider name (e.g. \"claude\", \"opencode\"). Default: \"claude\".",
+      "type": "string"
+    },
+    "resources": {
+      "$ref": "#/$defs/ContainerResourceLimits",
+      "description": "Optional per-container resource caps. Unset fields default to Docker's unlimited. Strongly recommended in multi-user deployments."
+    },
+    "skills": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "const": "all",
+          "type": "string"
+        }
+      ],
+      "description": "Which skills to enable — array of skill names or \"all\" (default)."
+    }
+  },
+  "$defs": {
+    "A2aSessionMode": {
+      "enum": [
+        "agent-shared",
+        "root-session"
+      ],
+      "type": "string"
+    },
+    "AdditionalMountConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "containerPath": {
+          "type": "string"
+        },
+        "hostPath": {
+          "type": "string"
+        },
+        "readonly": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hostPath",
+        "containerPath"
+      ],
+      "type": "object"
+    },
+    "ContainerResourceLimits": {
+      "additionalProperties": false,
+      "description": "Per-agent-group container resource limits. All fields are optional and map directly onto Docker run flags. When a field is unset the Docker default applies (unlimited). Strongly recommended in multi-tenant deployments — a single runaway agent can otherwise exhaust host memory or fork-bomb the kernel.",
+      "properties": {
+        "cpus": {
+          "description": "CPU share, can be fractional → `--cpus=<N>`.",
+          "type": "number"
+        },
+        "memoryMb": {
+          "description": "Memory limit in MiB → `--memory=<N>m`.",
+          "type": "number"
+        },
+        "pidsLimit": {
+          "description": "Max processes inside the container → `--pids-limit=<N>`.",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "EnterpriseGatewayConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "baseUrl": {
+          "description": "Base URL for the ERP gateway, without a trailing slash.",
+          "type": "string"
+        },
+        "defaultHeaders": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Static headers to send on every ERP gateway request.",
+          "type": "object"
+        },
+        "signingHeaders": {
+          "additionalProperties": false,
+          "description": "Overrides for the three signing header names. Leave unset to use the defaults above — only set this if the gateway you're fronting has mandatory header naming rules.",
+          "properties": {
+            "nonce": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "signingKey": {
+          "description": "Optional HMAC signing key. When set, every gateway request is signed: `x-frontlane-timestamp`, `x-frontlane-nonce`, and `x-frontlane-signature = HMAC-SHA256(key, timestamp + \".\" + nonce + \".\" + body)`. Gateways that validate signatures can then reject requests that didn't come from a host-provisioned container. Pair with a short clock-skew window (e.g. ±5 minutes) and a replay cache on the gateway side.",
+          "type": "string"
+        },
+        "timeoutMs": {
+          "description": "Request timeout for built-in ERP gateway MCP tools. Default: 15000 ms.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "baseUrl"
+      ],
+      "type": "object"
+    },
+    "McpServerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "instructions": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "MemoryMode": {
+      "enum": [
+        "workspace",
+        "erp"
+      ],
+      "type": "string"
+    }
+  }
+}

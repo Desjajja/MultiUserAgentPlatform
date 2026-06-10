@@ -25,6 +25,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { initContainerOTel } from './observability/init.js';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 // Providers barrel — each enabled provider self-registers on import.
@@ -42,6 +43,9 @@ const CWD = '/workspace/agent';
 async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
+
+  const sessionId = process.env.FRONTLANE_SESSION_ID || 'unknown';
+  initContainerOTel(sessionId);
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
@@ -98,6 +102,8 @@ async function main(): Promise<void> {
     provider,
     providerName,
     cwd: CWD,
+    sessionId: process.env.FRONTLANE_SESSION_ID || 'unknown',
+    agentGroupId: config.agentGroupId,
     systemContext: { instructions },
     idleExitMs: config.idleExitMs,
   });

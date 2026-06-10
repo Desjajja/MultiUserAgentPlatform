@@ -6,6 +6,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
 import { touchHeartbeat } from '../db/connection.js';
 import { setContinuation } from '../db/session-state.js';
+import { injectTraceparent } from '../observability/init.js';
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -1046,10 +1047,10 @@ export class OpenAIProvider implements AgentProvider {
           response = await withHeartbeat(() =>
             fetch(`${this.baseUrl}/responses`, {
               method: 'POST',
-              headers: {
+              headers: injectTraceparent({
                 'content-type': 'application/json',
                 authorization: `Bearer ${this.apiKey}`,
-              },
+              }),
               body: JSON.stringify(body),
               signal: controller.signal,
             }),
@@ -1157,10 +1158,10 @@ export class OpenAIProvider implements AgentProvider {
           response = await withHeartbeat(() =>
             fetch(`${this.baseUrl}/chat/completions`, {
               method: 'POST',
-              headers: {
+              headers: injectTraceparent({
                 'content-type': 'application/json',
                 authorization: `Bearer ${this.apiKey}`,
-              },
+              }),
               body: JSON.stringify(body),
               signal: controller.signal,
             }),

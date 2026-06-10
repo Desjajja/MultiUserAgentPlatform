@@ -64,7 +64,7 @@ const REQUIRED_ENV_LINES = [
 ];
 
 const FORBIDDEN_OBSERVABILITY_IMPORTS = [/@opentelemetry\//, /@arizeai\/openinference-/];
-const RUNTIME_FORBIDDEN_OTEL_ONLY = [/@opentelemetry\//];
+const RUNTIME_FORBIDDEN_OTEL_ONLY = [/@opentelemetry\/sdk-/, /@opentelemetry\/exporter-/, /@opentelemetry\/auto-/];
 const RUNTIME_FORBIDDEN_OTHER = [/@arizeai\/openinference-/, /PHOENIX_/, /OTEL_/];
 
 const tempDirs: string[] = [];
@@ -192,7 +192,7 @@ it('keeps PR-O1 scope free of telemetry package imports and runtime observabilit
     if (!fs.existsSync(observabilityDir)) return;
 
     const tempFile = path.join(makeTempDir(), 'otel-permission-test.ts');
-    fs.writeFileSync(tempFile, "import '@opentelemetry/api';\nimport '@opentelemetry/sdk-trace-base';\n");
+    fs.writeFileSync(tempFile, "import '@opentelemetry/sdk-trace-node';\nimport '@opentelemetry/exporter-trace-otlp-proto';\nimport '@opentelemetry/auto-instrumentations-node';\n");
     tempDirs.pop();
 
     const content = readUtf8(tempFile);

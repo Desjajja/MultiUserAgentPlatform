@@ -1,0 +1,25 @@
+# LiteLLM Proxy Configuration
+# See: docs/litellm-gateway.md, ADR-0016
+#
+# Frontdesk lane testing — unified deepseek-v4-flash via opencode-go endpoint.
+
+model_list:
+  - model_name: "deepseek-v4-flash"
+    litellm_params:
+      model: "openai/deepseek-v4-flash"
+      api_key: "sk-6SaUXK5nUKAOHUnpJb3UbuD8HTIRH173F1FBOEF0hGbHXAFQV1AsyE14QEdONuxZ"
+      api_base: "https://opencode.ai/zen/go/v1"
+
+litellm_settings:
+  # W3C traceparent propagation — allows container traceparent to flow through
+  enable_traceparent_in_header: true
+  # Phoenix callback — sends GenAI spans to Phoenix via OTLP
+  success_callback: ["arize_phoenix"]
+  failure_callback: ["arize_phoenix"]
+  # No caching (keep simple for now)
+  cache: false
+  # Drop params not supported by the model (avoids 400 errors)
+  drop_params: true
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"

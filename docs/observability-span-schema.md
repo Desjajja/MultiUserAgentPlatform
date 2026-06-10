@@ -1,15 +1,16 @@
 # MUAP Observability Span Naming Schema
 > **位置**：`docs/observability-span-schema.md`
 > **目的**：定义 MUAP manual `withSpan(...)` spans 的 binding naming + attribute governance。任何后续 PR 在新增、重命名、删除、迁移 manual spans 之前，**必须**先读这一篇。
-> **状态**：v1.0（binding · 2026-05-31）
+> **状态**：v1.1（binding · 2026-06-01）
 > **适用范围**：FrontLane / MUAP host 与 runner 的 manual spans；third-party auto-instrumentation 可共存，但不支配 MUAP naming。
 ---
 ## §0. Status Block
-> **Version**: `v1.0`
+> **Version**: `v1.2`
 > **Authority**: **binding** for all MUAP manual `withSpan(...)` calls.
-> **Date**: `2026-05-31`
-> **Supersedes**: none（本文件是第一版 schema spec，不替代历史 runtime code）
-> **Relates to**: `ADR-0011`、`ADR-0014`、`docs/observability-instrumentation-methodology.md` v1.0
+> **Date**: `2026-06-02`
+> **Supersedes**: v1.1（2026-06-01）
+> **Changelog**: v1.2: Added business tag taxonomy (`muap.*`), AI Semantic vs Platform Telemetry layer separation, fixed container-side `agent.turn` span lifecycle (PR-O3 fix)
+> **Relates to**: `ADR-0011`、`ADR-0014`、`ADR-0016`、`docs/observability-instrumentation-methodology.md` v1.1
 > **Scope**: 只约束 MUAP 手写 spans 的 naming / attribute contract，不重命名 third-party auto-instrumentation spans。
 > **Precedence**: 若本文件与旧 prose 示例冲突，以本 schema 为准；`docs/observability-instrumentation-methodology.md` 解释 how to instrument，本文件定义 what to name and what attributes to set。
 本文件是 governance spec，不是 runtime patch。
@@ -300,6 +301,7 @@ methodology §3 解释了 Phoenix / OpenInference 为什么需要语义 attribut
 | TOOL spans (`mcp.*`, `erp.*`) | `TOOL` | `tool.name`, `tool.parameters` | `tool.output`, `erp.operation`, `erp.request_id` if available | `mcp.erp.execute` and `erp.call` are distinct but both TOOL |
 | CHAIN spans (`router.*`, `delivery.*`, default orchestration spans) | `CHAIN` | none beyond global kind | `session.id`, `user.id`, `message.kind`, `channel.type` when query value is high | use for orchestration, routing, queueing, coordination |
 | AGENT spans (`agent.run`, `agent.turn`) | `AGENT` | none beyond global kind | `session.id`, `user.id`, `output.value`, `output.mime_type` when turn yields answer | do not re-label provider calls as AGENT; nested provider stays LLM |
+| `agent.turn` (container-side) | `CHAIN` | `session.id`, `agent.group.id`, `provider` | `agent.turn.index` | container OTel span; kind=CHAIN per §5b.8; child of host-side `router.deliver_to_agent` trace via W3C traceparent |
 ### 5.3 Required-by-category detail
 #### Root spans
 当前版本只锁定一个 current session root：`router.deliver_to_agent`。
@@ -435,6 +437,85 @@ session / user semantic context 继续通过 OpenInference context propagation p
 幂等保证：`endSessionRootSpan` 和 `failSessionRootSpan` 先从 Map 中 delete 再 end，第二次调用为 no-op。
 
 非 wake 路径（accumulate、command gate filter/deny）在 router 内直接 `rootSpan.end()`，不经过 bridge。
+
+### §5b.7 LiteLLM Proxy span layer
+
+LiteLLM Proxy 作为 MUAP 的 LLM 网关，通过其内置的 `arize_phoenix` callback 自动产出符合 GenAI 语义规范的 spans。这些 spans 不由 MUAP 代码控制，属于 third-party auto-instrumentation（见 §9.1）。
+
+**Span hierarchy（由 LiteLLM 自动产出）**
+
+```
+Received Proxy Server Request  (SpanKind=SERVER)
+  litellm_request              (SpanKind=INTERNAL)
+    raw_gen_ai_request         (SpanKind=INTERNAL)
+```
+
+**Trace placement**
+
+容器侧出站 HTTP 请求到 LiteLLM Proxy 时，会自动注入 W3C `traceparent` header（见 §5b.8）。LiteLLM 读取该 header 后，将 `Received Proxy Server Request` 挂在容器侧 `agent.turn` span 之下，最终整棵 trace tree 归属于 host 侧 `router.deliver_to_agent` root span。
+
+**关键 attributes（由 LiteLLM 自动填充）**
+
+| Attribute | 含义 |
+|---|---|
+| `gen_ai.usage.input_tokens` | 本次请求消耗的 input token 数 |
+| `gen_ai.usage.output_tokens` | 本次请求消耗的 output token 数 |
+| `gen_ai.cost.total` | 本次请求的估算费用 |
+| `gen_ai.request.model` | 请求时指定的 model 名称 |
+| `gen_ai.response.model` | 实际响应的 model 名称 |
+| `gen_ai.input.messages` | 请求消息列表（LiteLLM 自动截断/redact） |
+| `gen_ai.output.messages` | 响应消息列表 |
+
+**service.name**: `litellm-proxy`
+
+**MUAP 的责任边界**
+
+MUAP 不重命名这些 spans，也不修改它们的 attributes，遵循 §9.1 third-party auto-instrumentation 共存原则。MUAP 的唯一职责是确保容器侧出站 HTTP 请求正确注入 `traceparent` header，使 LiteLLM spans 能挂在正确的 trace tree 下。
+
+### §5b.8 Container OTel spans (PR-O3)
+
+PR-O3 为容器 agent-runner 新增最小化 OTel 初始化，使容器侧 spans 能通过 W3C traceparent 挂在主机侧 trace 下，形成完整的端到端 trace tree。
+
+**初始化方式**
+
+容器启动时读取 `OTEL_TRACEPARENT` 环境变量（由 host 在 `container.spawn` 时注入，见 §5b.4），创建 `TracerProvider`，OTLP exporter 指向 Phoenix 实例（protobuf over HTTP）。
+
+**容器侧 span**
+
+| Span | kind | 含义 |
+|---|---|---|
+| `agent.turn` | `CHAIN` | 包裹单次 LLM 调用 + tool execution cycle |
+
+`agent.turn` 通过从 `OTEL_TRACEPARENT` 提取的 parent context 挂在主机侧 `router.deliver_to_agent` trace 下，形成跨进程的连续 trace。
+
+**生命周期设计**
+
+`agent.turn` 的结束点不是 `processQuery()` 的函数返回（因为 provider 事件流会长期挂起等待 follow-up），而是**首个 `result` 事件被处理完毕**。实现上使用 `startAgentTurn()` 创建 span 并返回 `complete()/fail()` handle；`poll-loop.ts` 在 `event.type === 'result'` 时调用 `completeInitialTurn()` 结束 span。
+
+**Required attributes**
+
+| Attribute | 说明 |
+|---|---|
+| `openinference.span.kind` | `CHAIN` |
+| `session.id` | 当前会话 ID |
+| `agent.group.id` | agent group 标识 |
+| `muap.layer` | `'ai'`（AI 语义层） |
+| `muap.route_type` | `'worker'` |
+| `muap.lane` | `'worker'` |
+| `muap.provider` | LLM provider 名称（如 `sdk-openai`） |
+
+**Optional attributes**
+
+| Attribute | 说明 |
+|---|---|
+| `agent.turn.index` | 当前 turn 在本次会话中的序号（从 0 开始） |
+
+**出站 HTTP 自动注入**
+
+容器侧 OTel SDK 对出站 HTTP 请求（包括到 LiteLLM Proxy 的请求）自动注入 `traceparent` header，使 LiteLLM 产出的 spans（见 §5b.7）能正确挂在 `agent.turn` 之下。
+
+**service.name**: `agent-runner-{session_id_prefix}`（其中 `session_id_prefix` 取 session ID 的前 8 位，保持低基数）
+
 ---
 ## §6. Forbidden Patterns
 下面这些 pattern 在 v1.0 中一律禁止；看到它们不应“先 merge 再 cleanup”，而应直接视为 schema violation。
@@ -725,6 +806,7 @@ span.setAttributes({
 | Phase 2B hardware skills | `hardware.<system>.*` | dynamic device ids go to `hardware.device_id` |
 | Phase 2B+ Python skill services | `python_skill.run` | service name goes to `python_skill.name` |
 | Phase 3 GUI | `gui.*` | GUI app/window specifics stay in attributes |
+| PR-O3 container OTel + LiteLLM | `agent.turn`, LiteLLM auto spans | container spans follow schema §5b.8; LiteLLM spans are third-party (§9.1) |
 ### 10.2 Extension heuristics
 未来新增 family 时，优先套用这些 heuristics：
 - 新 surface 如果本质上是 MCP tool group，先放进 `mcp.*`；

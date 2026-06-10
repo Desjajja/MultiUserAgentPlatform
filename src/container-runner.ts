@@ -34,6 +34,7 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { chainAttrs } from './observability/openinference.js';
 import { getActiveSpan } from './observability/tracer.js';
 import { withSpan } from './observability/with-span.js';
+import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
 import { injectTraceContext } from './observability/trace-context.js';
 import { failSessionRootSpan } from './observability/context-bridge.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -112,10 +113,14 @@ export function shouldAdmitWake(args: { activeCount: number; inflightCount: numb
  * sweep tick picks up the session once earlier containers have exited.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
-  return withSpan(
-    'container.wake',
-    chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
-    async () => {
+    return withSpan(
+      'container.wake',
+      chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
+      async () => {
+        applyBusinessTags(getActiveSpan(), {
+          [BusinessTagKeys.LAYER]: 'platform',
+          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        });
       if (activeContainers.has(session.id)) {
         log.debug('Container already running', { sessionId: session.id });
         return true;
@@ -161,6 +166,10 @@ async function spawnContainer(session: Session): Promise<void> {
     'container.spawn',
     chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
     async () => {
+      applyBusinessTags(getActiveSpan(), {
+        [BusinessTagKeys.LAYER]: 'platform',
+        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+      });
     const agentGroup = getAgentGroup(session.agent_group_id);
     if (!agentGroup) {
       log.error('Agent group not found', { agentGroupId: session.agent_group_id });
@@ -269,6 +278,10 @@ async function spawnContainer(session: Session): Promise<void> {
 /** Kill a container for a session. */
 export async function killContainer(sessionId: string, reason: string): Promise<void> {
   await withSpan('container.kill', chainAttrs({ 'session.id': sessionId, reason }), async () => {
+    applyBusinessTags(getActiveSpan(), {
+      [BusinessTagKeys.LAYER]: 'platform',
+      [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+    });
     const entry = activeContainers.get(sessionId);
     if (!entry) return;
 

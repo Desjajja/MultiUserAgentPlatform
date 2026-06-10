@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MUAP LiteLLM Proxy 迁移方案 — 可行性分析与实施计划</title>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --text: #e0e0e0;
+      --accent: #4fc3f7;
+      --warning: #ffb74d;
+      --error: #ef5350;
+      --success: #66bb6a;
+      --bg-light: #232342;
+      --border: #333355;
+    }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      line-height: 1.6;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+    }
+    h1, h2, h3 { color: var(--accent); margin-top: 2rem; margin-bottom: 1rem; }
+    h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 0.5rem; margin-top: 1rem; }
+    h2 { font-size: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+    h3 { font-size: 1.25rem; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+    th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }
+    th { background-color: var(--bg-light); color: var(--accent); font-weight: 600; }
+    tr:nth-child(even) { background-color: rgba(35, 35, 66, 0.5); }
+    code { background-color: var(--bg-light); padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.85em; color: var(--accent); }
+    pre { background-color: #0d0d1a; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; }
+    pre code { background: none; padding: 0; color: var(--text); }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.8rem; font-weight: 600; }
+    .badge-ok { background: rgba(102,187,106,0.2); color: var(--success); }
+    .badge-warn { background: rgba(255,183,77,0.2); color: var(--warning); }
+    .badge-err { background: rgba(239,83,80,0.2); color: var(--error); }
+    .callout { border-left: 4px solid var(--success); background: rgba(102,187,106,0.08); padding: 0.75rem 1rem; margin: 1rem 0; border-radius: 0 6px 6px 0; }
+    .callout-warn { border-left-color: var(--warning); background: rgba(255,183,77,0.08); }
+    .approval-section { background: var(--bg-light); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 2rem 0; }
+    .approval-item { display: flex; align-items: flex-start; gap: 0.75rem; margin: 0.75rem 0; padding: 0.5rem; border-radius: 4px; }
+    .approval-item:hover { background: rgba(79,195,247,0.05); }
+    .checkbox { width: 20px; height: 20px; border: 2px solid var(--accent); border-radius: 4px; flex-shrink: 0; margin-top: 2px; }
+    .sig-line { border-top: 1px solid var(--border); margin-top: 2rem; padding-top: 1rem; display: flex; gap: 3rem; }
+    .sig-field { flex: 1; }
+    .sig-field label { font-size: 0.8rem; color: #888; }
+    .sig-field .line { border-bottom: 1px solid var(--text); height: 2rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+
+<h1>MUAP LiteLLM Proxy 迁移方案</h1>
+<p style="color:#888; margin-top:-0.5rem;">可行性分析与实施计划 &mdash; 2026-06-01</p>
+
+<h2>1. 执行摘要</h2>
+<p>将 LiteLLM Proxy 作为 LLM 网关接入 MUAP 平台，实现：</p>
+<ul>
+  <li><strong>统一 LLM 可观测性</strong> &mdash; token 用量、成本、延迟自动出现在 Phoenix trace 中</li>
+  <li><strong>补齐 PR-O3 容器侧 OTel 缺口</strong> &mdash; ADR-0011 已记录的待办项</li>
+  <li><strong>为未来多模型路由/fallback/限流打基础</strong></li>
+</ul>
+
+<h2>2. 当前架构分析</h2>
+
+<h3>2.1 追踪链现状</h3>
+<pre><code>Host (frontlane-host) ──OTLP──&gt; Phoenix:6006
+  └─ router.deliver_to_agent (root span, kind=AGENT)
+     ├─ container.spawn / container.wake
+     ├─ delivery.session.drain
+     │   ├─ delivery.message.deliver
+     │   └─ delivery.channel.send
+     └─ [TRACE BREAKS HERE] ❌
+
+Container (agent-runner) ──fetch──&gt; OpenAI API
+  └─ ZERO OTel instrumentation
+  └─ OTEL_TRACEPARENT injected but IGNORED
+  └─ No traceparent header on outbound fetch()</code></pre>
+
+<h3>2.2 关键文件</h3>
+<table>
+  <tr><th>文件</th><th>角色</th></tr>
+  <tr><td><code>src/observability/init.ts</code></td><td>主机 OTel SDK 初始化，OTLP HTTP/Protobuf 到 localhost:6006/v1/traces</td></tr>
+  <tr><td><code>src/container-runner.ts:208-213</code></td><td>注入 OTEL_TRACEPARENT env var 到容器</td></tr>
+  <tr><td><code>src/observability/trace-context.ts</code></td><td>injectTraceContext() 使用 W3C propagation</td></tr>
+  <tr><td><code>container/agent-runner/src/providers/openai.ts</code></td><td>1231 行，fetch() 到 /responses 和 /chat/completions，stream:false</td></tr>
+  <tr><td><code>container/agent-runner/src/providers/sdk-openai.ts</code></td><td>AI SDK 接入点，createOpenAICompatible()</td></tr>
+  <tr><td><code>container/agent-runner/package.json</code></td><td>零 @opentelemetry/* 依赖</td></tr>
+</table>
+
+<h3>2.3 baseUrl 配置流</h3>
+<pre><code>Host process.env.OPENAI_BASE_URL
+  → src/providers/openai.ts (buildOpenAIContribution)
+  → docker run -e OPENAI_BASE_URL=...
+  → Container process.env
+  → openai.ts: normalizeBaseUrl() → this.baseUrl
+  → fetch(`${this.baseUrl}/responses`)</code></pre>
+<div class="callout">
+  <strong>结论：</strong>零代码改动即可重定向 LLM 流量，只需设置 <code>OPENAI_BASE_URL=http://host.docker.internal:4000</code>
+</div>
+
+<h2>3. LiteLLM Proxy 能力评估</h2>
+
+<h3>3.1 Phoenix 集成</h3>
+<table>
+  <tr><th>能力</th><th>状态</th><th>说明</th></tr>
+  <tr><td>W3C traceparent 传播</td><td><span class="badge badge-ok">✅</span></td><td>客户端发 traceparent → Proxy 创建 child span</td></tr>
+  <tr><td>OTLP 导出到 Phoenix</td><td><span class="badge badge-ok">✅</span></td><td>PHOENIX_COLLECTOR_HTTP_ENDPOINT</td></tr>
+  <tr><td>GenAI 语义属性</td><td><span class="badge badge-ok">✅</span></td><td>gen_ai.usage.*, gen_ai.cost.*, gen_ai.request.model</td></tr>
+  <tr><td>消息内容捕获</td><td><span class="badge badge-ok">✅</span></td><td>gen_ai.input.messages, gen_ai.output.messages</td></tr>
+  <tr><td>流式追踪</td><td><span class="badge badge-ok">✅</span></td><td>SSE streaming 支持</td></tr>
+</table>
+
+<h3>3.2 Responses API 兼容性</h3>
+<table>
+  <tr><th>场景</th><th>状态</th><th>影响</th></tr>
+  <tr><td>/responses stream:false</td><td><span class="badge badge-ok">✅ 安全</span></td><td>我们的主要使用方式</td></tr>
+  <tr><td>/responses stream:true</td><td><span class="badge badge-warn">⚠️ Bug #20975</span></td><td>SSE 生命周期事件缺失，但我们不用 streaming</td></tr>
+  <tr><td>/chat/completions stream:false</td><td><span class="badge badge-ok">✅ 安全</span></td><td>完全兼容</td></tr>
+  <tr><td>/chat/completions stream:true</td><td><span class="badge badge-ok">✅ 安全</span></td><td>成熟稳定</td></tr>
+</table>
+<div class="callout">
+  <strong>关键结论：</strong>我们的 <code>openai.ts</code> 使用 <code>stream: false</code>（line 1029, 1150），LiteLLM 的 SSE bug 不影响我们。<code>parseSseResponse</code> 只是 fallback parser，只需要 <code>response.completed</code> 和 <code>response.output_item.done</code> 事件。
+</div>
+
+<h3>3.3 不受影响的模块</h3>
+<table>
+  <tr><th>模块</th><th>原因</th></tr>
+  <tr><td><code>openai.ts</code> 1231 行核心逻辑</td><td>MCP bridge、continuation state、transcript replay 等应用层逻辑不变，只是 baseUrl 变了</td></tr>
+  <tr><td><code>claude.ts</code></td><td>Claude Code SDK 不走 HTTP，不经过 proxy</td></tr>
+  <tr><td><code>src/observability/</code> 主机侧</td><td>已有的 root span bridge 不变</td></tr>
+  <tr><td><code>src/router.ts</code>, <code>src/delivery.ts</code></td><td>不涉及 LLM 调用</td></tr>
+</table>
+
+<h2>4. 目标架构</h2>
+<pre><code>Host (frontlane-host)          Container (agent-runner)       LiteLLM Proxy        LLM API
+┌─────────────────────┐       ┌──────────────────────┐     ┌──────────────┐     ┌─────────┐
+│ router.deliver_to_  │       │ initContainerTracing()│     │              │     │         │
+│ agent (root span)   │──env──│ reads OTEL_TRACEPARENT│     │ Received     │     │         │
+│                     │  var  │ creates child span    │─────│ Proxy Server │─────│ OpenAI  │
+│ container.spawn     │       │ fetch + traceparent   │http │ Request      │http │ /v1/... │
+│ delivery.*          │       │ header               │     │ litellm_req  │     │         │
+└─────────────────────┘       └──────────────────────┘     └──────────────┘     └─────────┘
+     ↓ OTLP                        ↓ OTLP                      ↓ OTLP
+  Phoenix:6006 ◄──────────────── Phoenix:6006 ◄──────────── Phoenix:6006</code></pre>
+
+<h3>Phoenix Trace Tree（目标）</h3>
+<pre><code>router.deliver_to_agent (AGENT, ~5s)
+├── container.wake (INTERNAL, ~1s)
+├── container.agent_turn (CHAIN, 新增)
+│   └── Received Proxy Server Request (SERVER, LiteLLM)
+│       └── litellm_request (INTERNAL, LiteLLM)
+├── delivery.session.drain (CHAIN)
+│   ├── delivery.message.deliver (CHAIN)
+│   └── delivery.channel.send (CHAIN)
+└── [root span ends with output.value]</code></pre>
+
+<h2>5. 实施计划</h2>
+
+<h3>Phase 1: LiteLLM Proxy 基础设施 (Day 1)</h3>
+<table>
+  <tr><th>任务</th><th>文件</th><th>说明</th></tr>
+  <tr><td>1.1 创建 LiteLLM compose stack</td><td><code>infra/litellm/docker-compose.yml</code></td><td>独立 project muap-litellm，port 4000</td></tr>
+  <tr><td>1.2 创建 LiteLLM 配置</td><td><code>infra/litellm/config.yaml</code></td><td>model_list + arize_phoenix callback</td></tr>
+  <tr><td>1.3 创建环境变量模板</td><td><code>infra/litellm/.env.example</code></td><td>API keys, Phoenix endpoint</td></tr>
+  <tr><td>1.4 添加 npm scripts</td><td><code>package.json</code></td><td>litellm:up, litellm:down, litellm:logs</td></tr>
+  <tr><td>1.5 更新 env 生成器</td><td><code>scripts/generate-env-local-proposed.ts</code></td><td>新增 LITELLM_* 变量</td></tr>
+</table>
+
+<h3>Phase 2: 容器 OTel 初始化 — PR-O3 (Day 1-2)</h3>
+<table>
+  <tr><th>任务</th><th>文件</th><th>说明</th></tr>
+  <tr><td>2.1 添加 OTel 依赖</td><td><code>container/agent-runner/package.json</code></td><td>@opentelemetry/api, sdk-trace-node, exporter-trace-otlp-proto, resources</td></tr>
+  <tr><td>2.2 创建容器 OTel init</td><td><code>container/agent-runner/src/observability/init.ts</code></td><td>读取 OTEL_TRACEPARENT，创建 TracerProvider，OTLP exporter</td></tr>
+  <tr><td>2.3 创建 propagation helper</td><td><code>container/agent-runner/src/observability/propagate.ts</code></td><td>注入 traceparent 到 outbound HTTP headers</td></tr>
+  <tr><td>2.4 修改 openai.ts fetch</td><td><code>container/agent-runner/src/providers/openai.ts</code></td><td>在 fetch headers 中添加 traceparent（2 处）</td></tr>
+  <tr><td>2.5 修改 sdk-openai.ts</td><td><code>container/agent-runner/src/providers/sdk-openai.ts</code></td><td>传入 custom fetch with traceparent</td></tr>
+  <tr><td>2.6 修改容器入口</td><td><code>container/agent-runner/src/index.ts</code></td><td>调用 initContainerTracing()</td></tr>
+  <tr><td>2.7 更新 Dockerfile</td><td><code>container/Dockerfile</code></td><td>确保 OTel 包被安装（pnpm install 自动处理）</td></tr>
+</table>
+
+<h3>Phase 3: 主机侧配置 (Day 2)</h3>
+<table>
+  <tr><th>任务</th><th>文件</th><th>说明</th></tr>
+  <tr><td>3.1 文档化 env 配置</td><td><code>.env.local.proposed</code></td><td>OPENAI_BASE_URL=http://host.docker.internal:4000</td></tr>
+  <tr><td>3.2 可选：添加 LITELLM_PROXY_URL</td><td><code>src/providers/openai.ts</code></td><td>如果设置了 LITELLM_PROXY_URL，覆盖 OPENAI_BASE_URL</td></tr>
+</table>
+
+<h3>Phase 4: 验证与 Gate (Day 2-3)</h3>
+<table>
+  <tr><th>任务</th><th>文件</th><th>说明</th></tr>
+  <tr><td>4.1 更新 span schema</td><td><code>docs/observability-span-schema.md</code></td><td>新增 container + LiteLLM span 层</td></tr>
+  <tr><td>4.2 更新 coverage gate</td><td><code>scripts/observability-coverage-lib.ts</code></td><td>检查容器 OTel 覆盖</td></tr>
+  <tr><td>4.3 端到端验证</td><td>manual</td><td>发消息 → 检查 Phoenix trace tree 完整性</td></tr>
+  <tr><td>4.4 typecheck + test</td><td>CI</td><td>pnpm typecheck &amp;&amp; pnpm test</td></tr>
+</table>
+
+<h3>Phase 5: 文档与 ADR (Day 3)</h3>
+<table>
+  <tr><th>任务</th><th>文件</th><th>说明</th></tr>
+  <tr><td>5.1 写 ADR</td><td><code>docs/decisions/ADR-NNNN-litellm-proxy.md</code></td><td>记录决策：为什么引入、为什么独立部署、为什么不替换 claude</td></tr>
+  <tr><td>5.2 更新架构文档</td><td><code>docs/architecture.md</code></td><td>新增 LiteLLM 拓扑图</td></tr>
+  <tr><td>5.3 更新 README</td><td><code>README.md</code></td><td>LiteLLM 快速启动说明</td></tr>
+</table>
+
+<h2>6. 风险评估</h2>
+<table>
+  <tr><th>风险</th><th>概率</th><th>影响</th><th>缓解</th></tr>
+  <tr><td>LiteLLM 不兼容某些 Responses API 参数</td><td>低</td><td>中</td><td>我们用 stream:false，已验证兼容</td></tr>
+  <tr><td>容器 OTel 初始化增加启动延迟</td><td>低</td><td>低</td><td>OTel SDK init &lt; 50ms</td></tr>
+  <tr><td>LiteLLM Proxy 宕机导致 LLM 不可用</td><td>中</td><td>高</td><td>健康检查 + fallback 到直连</td></tr>
+  <tr><td>trace_id 不匹配导致 Phoenix 显示断裂</td><td>低</td><td>中</td><td>端到端验证</td></tr>
+  <tr><td>Docker 网络问题（host.docker.internal 不通）</td><td>低</td><td>高</td><td>已有 hostGatewayArgs() 处理 Linux</td></tr>
+</table>
+
+<h2>7. 回退策略</h2>
+<ol>
+  <li>移除 <code>OPENAI_BASE_URL</code> 覆盖（或设回 <code>https://api.openai.com/v1</code>）</li>
+  <li>容器 OTel 代码保留（不影响功能，只是 trace 不经过 proxy）</li>
+  <li>LiteLLM compose stack 可独立停止：<code>pnpm litellm:down</code></li>
+</ol>
+
+<h2>8. 收益总结</h2>
+<table>
+  <tr><th>收益</th><th>说明</th></tr>
+  <tr><td>统一 LLM 可观测性</td><td>每次 LLM 调用自动出现在 Phoenix trace，含 token/cost/latency</td></tr>
+  <tr><td>补齐 PR-O3</td><td>容器侧 OTel 初始化 + traceparent 传播一并完成</td></tr>
+  <tr><td>完整 trace tree</td><td>Host → Container → LiteLLM → 全部在一个 Phoenix trace</td></tr>
+  <tr><td>模型路由/fallback</td><td>LiteLLM 支持 model alias、fallback chain、load balancing</td></tr>
+  <tr><td>成本追踪</td><td>gen_ai.cost.* 自动计算</td></tr>
+  <tr><td>Rate limit 管理</td><td>LiteLLM 内置 RPM/TPM 限流</td></tr>
+  <tr><td>多模型统一接口</td><td>未来加新 provider 只需改 LiteLLM config</td></tr>
+</table>
+
+<h2>9. 审批签章</h2>
+<div class="approval-section">
+  <h3 style="margin-top:0;">请确认以下决策项</h3>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>1.</strong> LiteLLM Proxy 作为独立 compose stack（<code>muap-litellm</code>），不合并到 observability stack</div>
+  </div>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>2.</strong> 仅 openai / sdk-openai / codex provider 经过 LiteLLM，claude provider 保持原样</div>
+  </div>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>3.</strong> 容器 OTel 采用最小化方案（仅 trace propagation，不做 full auto-instrumentation）</div>
+  </div>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>4.</strong> 使用 <code>host.docker.internal:4000</code> 作为容器到 proxy 的通信路径</div>
+  </div>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>5.</strong> 向后兼容：不设 LITELLM_PROXY_URL 时系统照常直连 OpenAI</div>
+  </div>
+  
+  <div class="approval-item">
+    <div class="checkbox"></div>
+    <div><strong>6.</strong> LiteLLM Proxy 资源配置：4 CPU, 8GB RAM, 4 workers（生产）；开发环境 2 CPU, 4GB, 2 workers</div>
+  </div>
+
+  <div class="sig-line">
+    <div class="sig-field">
+      <label>审批人</label>
+      <div class="line"></div>
+    </div>
+    <div class="sig-field">
+      <label>日期</label>
+      <div class="line"></div>
+    </div>
+    <div class="sig-field">
+      <label>备注</label>
+      <div class="line"></div>
+    </div>
+  </div>
+</div>
+
+<p style="color:#666; font-size:0.8rem; margin-top:3rem; text-align:center;">
+  Generated by Sisyphus &mdash; MUAP Observability Pipeline &mdash; 2026-06-01
+</p>
+
+</body>
+</html>

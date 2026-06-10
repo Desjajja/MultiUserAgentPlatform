@@ -101,11 +101,16 @@ export function rootInputAttrs(opts: {
   userId?: string | null;
   inputValue: string;
 }): Record<string, unknown> {
-  return agentAttrs({
-    'session.id': opts.sessionId,
+  const attrs: Record<string, unknown> = {
     ...(opts.userId ? { 'user.id': opts.userId } : {}),
     ...inputAttrsForText(opts.inputValue),
-  });
+  };
+
+  if (opts.sessionId && opts.sessionId !== '') {
+    attrs['session.id'] = opts.sessionId;
+  }
+
+  return agentAttrs(attrs);
 }
 
 export function outputAttrs(output: string, mime: 'text' | 'json' = 'text'): Record<string, unknown> {

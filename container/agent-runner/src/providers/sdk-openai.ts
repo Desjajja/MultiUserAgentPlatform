@@ -1,6 +1,7 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { generateText } from 'ai';
 import { registerProvider } from './provider-registry.js';
+import { injectTraceparent } from '../observability/init.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
@@ -40,6 +41,7 @@ class SdkOpenAIProvider implements AgentProvider {
         name: 'sdk-openai',
         baseURL: self.baseURL,
         apiKey: self.apiKey,
+        headers: injectTraceparent({}),
       });
 
       let currentPrompt = input.prompt;
@@ -71,8 +73,8 @@ class SdkOpenAIProvider implements AgentProvider {
           yield {
             type: 'usage',
             model: self.model,
-            inputTokens: result.usage.promptTokens,
-            outputTokens: result.usage.completionTokens,
+            inputTokens: result.usage.inputTokens,
+            outputTokens: result.usage.outputTokens,
             totalTokens: result.usage.totalTokens,
             durationMs,
             transport: 'chat-completions',
