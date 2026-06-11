@@ -1,0 +1,1 @@
+/app/src/mcp-tools/erp-gateway.instructions.md
