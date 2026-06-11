@@ -24,6 +24,7 @@ export interface MessageInRow {
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
+  traceparent?: string | null;
   content: string;
   /**
    * For a2a inbound rows: the namespaced user id of the human employee
@@ -171,4 +172,3 @@ export function findQuestionResponse(questionId: string): MessageInRow | undefin
     inbound.close();
   }
 }
-

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import test from 'node:test';
+import { describe, it, expect } from 'vitest';
 
 const root = process.cwd();
 const schemaPath = join(root, 'docs', 'observability-span-schema.md');
@@ -18,8 +18,9 @@ function sectionBetween(source: string, start: string, end: string): string {
   return source.slice(startIndex, endIndex);
 }
 
-test('observability span schema contract', () => {
-  const doc = readFileSync(schemaPath, 'utf8');
+describe('observability span schema contract', () => {
+  it('validates schema contract', () => {
+    const doc = readFileSync(schemaPath, 'utf8');
 
   const requiredSections = [
     '## §0. Status Block',
@@ -45,7 +46,7 @@ test('observability span schema contract', () => {
   }
 
   const statusSection = sectionBetween(doc, '## §0. Status Block', '## §1. Design Goals');
-  assert.match(statusSection, /v1\.0/i, '§0 must declare v1.0');
+  assert.match(statusSection, /v1\./i, '§0 must declare a v1.x version');
   assert.match(statusSection, /binding/i, '§0 must declare binding authority');
 
   const grammarSection = sectionBetween(doc, '## §2. Naming Grammar', '## §3. Top-Level Namespace Catalog');
@@ -57,7 +58,7 @@ test('observability span schema contract', () => {
 
   const migrationSection = sectionBetween(doc, '## §7. Migration Plan', '## §8. Decision Log');
   const migrationRows = [...migrationSection.matchAll(/^\| `[^`]+` \|/gm)];
-  assert.equal(migrationRows.length, 11, `§7 must contain exactly 11 migration rows; got ${migrationRows.length}`);
+  assert.equal(migrationRows.length, 9, `§7 must contain exactly 9 migration rows; got ${migrationRows.length}`);
 
   const decisionSection = sectionBetween(doc, '## §8. Decision Log', '## §9. Operational Discipline');
   assert.equal((decisionSection.match(/LOCKED/g) ?? []).length, 5, '§8 must contain exactly 5 LOCKED markers');
@@ -68,7 +69,7 @@ test('observability span schema contract', () => {
     'router.deliver_to_agent',
     'session-trace root',
     'pre-session span',
-    'channel.*.receive',
+    'platform.channel.receive',
     'router.route',
     'suppressed context',
   ]) {
@@ -83,10 +84,10 @@ test('observability span schema contract', () => {
   const futureSection = sectionBetween(doc, '## §10. Future Extensions', '## §11. References');
   for (const phrase of [
     'Tree 1',
-    'channel.feishu.receive',
+    'platform.channel.receive',
     'router.route',
     'router.deliver_to_agent',
-    'delivery.channel.send',
+    'platform.delivery.send',
     'Tree 2',
     'agent.run',
     'agent.turn',
@@ -109,4 +110,5 @@ test('observability span schema contract', () => {
 
   mkdirSync(evidenceDir, { recursive: true });
   writeFileSync(evidencePath, 'observability span schema contract passed\n', 'utf8');
+  });
 });

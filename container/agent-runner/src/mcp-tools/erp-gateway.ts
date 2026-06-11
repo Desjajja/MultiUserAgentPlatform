@@ -21,6 +21,7 @@ import crypto from 'node:crypto';
 
 import { writeMessageOut } from '../db/messages-out.js';
 import { getConfig, type EnterpriseGatewayConfig, type RunnerConfig } from '../config.js';
+import { startToolSpan } from '../observability/tool-span.js';
 import { getRequestIdentity } from '../request-context.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { registerTools } from './server.js';
@@ -385,117 +386,146 @@ function agentBlock(runtime: ToolRuntimeConfig): Record<string, unknown> {
   };
 }
 
+function withErpToolSpan(
+  toolName: string,
+  args: Record<string, unknown>,
+  work: () => Promise<CallToolResult>,
+): Promise<CallToolResult> {
+  const operation = getString(args, 'operation');
+  return startToolSpan(
+    {
+      spanName: 'mcp.erp',
+      toolName,
+      toolParameters: args,
+      toolGroup: 'mcp',
+      bizDomain: 'erp',
+      ...(operation ? { erpOp: operation } : {}),
+    },
+    work,
+  );
+}
+
 export async function handleErpDescribe(
   runtime: ToolRuntimeConfig,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
-  const { context: requester, source: requesterSource } = resolveRequester(args);
-  const result = await callGateway(runtime, '/describe', {
-    agent: agentBlock(runtime),
-    requester,
-    requesterSource,
+  return withErpToolSpan('erp_describe', args, async () => {
+    const { context: requester, source: requesterSource } = resolveRequester(args);
+    const result = await callGateway(runtime, '/describe', {
+      agent: agentBlock(runtime),
+      requester,
+      requesterSource,
+    });
+    if (!result.ok) return err(result.message);
+    log(`erp_describe: ${requester.userId ?? 'anonymous'} (${requesterSource})`);
+    return ok(result.text);
   });
-  if (!result.ok) return err(result.message);
-  log(`erp_describe: ${requester.userId ?? 'anonymous'} (${requesterSource})`);
-  return ok(result.text);
 }
 
 export async function handleErpAuthorize(
   runtime: ToolRuntimeConfig,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
-  const operation = getString(args, 'operation');
-  if (!operation) return err('operation is required');
+  return withErpToolSpan('erp_authorize', args, async () => {
+    const operation = getString(args, 'operation');
+    if (!operation) return err('operation is required');
 
-  const { context: requester, source: requesterSource } = resolveRequester(args);
-  const result = await callGateway(runtime, '/authorize', {
-    agent: agentBlock(runtime),
-    requester,
-    requesterSource,
-    operation,
-    input: getRecord(args, 'input') ?? {},
-    context: getRecord(args, 'context') ?? {},
+    const { context: requester, source: requesterSource } = resolveRequester(args);
+    const result = await callGateway(runtime, '/authorize', {
+      agent: agentBlock(runtime),
+      requester,
+      requesterSource,
+      operation,
+      input: getRecord(args, 'input') ?? {},
+      context: getRecord(args, 'context') ?? {},
+    });
+    if (!result.ok) return err(result.message);
+    log(`erp_authorize: ${operation} for ${requester.userId ?? 'anonymous'} (${requesterSource})`);
+    return ok(result.text);
   });
-  if (!result.ok) return err(result.message);
-  log(`erp_authorize: ${operation} for ${requester.userId ?? 'anonymous'} (${requesterSource})`);
-  return ok(result.text);
 }
 
 export async function handleErpExecute(
   runtime: ToolRuntimeConfig,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
-  const operation = getString(args, 'operation');
-  if (!operation) return err('operation is required');
+  return withErpToolSpan('erp_execute', args, async () => {
+    const operation = getString(args, 'operation');
+    if (!operation) return err('operation is required');
 
-  const { context: requester, source: requesterSource } = resolveRequester(args);
-  const result = await callGateway(runtime, '/execute', {
-    agent: agentBlock(runtime),
-    requester,
-    requesterSource,
-    operation,
-    input: getRecord(args, 'input') ?? {},
-    context: getRecord(args, 'context') ?? {},
-    dryRun: getBoolean(args, 'dryRun') ?? false,
-    idempotencyKey: getString(args, 'idempotencyKey') ?? null,
+    const { context: requester, source: requesterSource } = resolveRequester(args);
+    const result = await callGateway(runtime, '/execute', {
+      agent: agentBlock(runtime),
+      requester,
+      requesterSource,
+      operation,
+      input: getRecord(args, 'input') ?? {},
+      context: getRecord(args, 'context') ?? {},
+      dryRun: getBoolean(args, 'dryRun') ?? false,
+      idempotencyKey: getString(args, 'idempotencyKey') ?? null,
+    });
+    if (!result.ok) return err(result.message);
+    log(`erp_execute: ${operation} for ${requester.userId ?? 'anonymous'} (${requesterSource})`);
+    return ok(result.text);
   });
-  if (!result.ok) return err(result.message);
-  log(`erp_execute: ${operation} for ${requester.userId ?? 'anonymous'} (${requesterSource})`);
-  return ok(result.text);
 }
 
 export async function handleErpMemoryGet(
   runtime: ToolRuntimeConfig,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
-  const namespace = getString(args, 'namespace');
-  if (!namespace) return err('namespace is required');
+  return withErpToolSpan('erp_memory_get', args, async () => {
+    const namespace = getString(args, 'namespace');
+    if (!namespace) return err('namespace is required');
 
-  const { context: requester, source: requesterSource } = resolveRequester(args);
-  const subject = resolveMemorySubject(args, requester);
-  if (!subject.ok) return err(subject.message);
+    const { context: requester, source: requesterSource } = resolveRequester(args);
+    const subject = resolveMemorySubject(args, requester);
+    if (!subject.ok) return err(subject.message);
 
-  const result = await callGateway(runtime, '/memory/get', {
-    agent: agentBlock(runtime),
-    requester,
-    requesterSource,
-    namespace,
-    subject: subject.subject,
-    query: getRecord(args, 'query') ?? {},
-    context: getRecord(args, 'context') ?? {},
+    const result = await callGateway(runtime, '/memory/get', {
+      agent: agentBlock(runtime),
+      requester,
+      requesterSource,
+      namespace,
+      subject: subject.subject,
+      query: getRecord(args, 'query') ?? {},
+      context: getRecord(args, 'context') ?? {},
+    });
+    if (!result.ok) return err(result.message);
+    log(`erp_memory_get: ${namespace} for ${subject.subject.type}:${subject.subject.id} (${requesterSource})`);
+    return ok(result.text);
   });
-  if (!result.ok) return err(result.message);
-  log(`erp_memory_get: ${namespace} for ${subject.subject.type}:${subject.subject.id} (${requesterSource})`);
-  return ok(result.text);
 }
 
 export async function handleErpMemoryUpsert(
   runtime: ToolRuntimeConfig,
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
-  const namespace = getString(args, 'namespace');
-  if (!namespace) return err('namespace is required');
+  return withErpToolSpan('erp_memory_upsert', args, async () => {
+    const namespace = getString(args, 'namespace');
+    if (!namespace) return err('namespace is required');
 
-  const value = getRecord(args, 'value');
-  if (!value) return err('value is required');
+    const value = getRecord(args, 'value');
+    if (!value) return err('value is required');
 
-  const { context: requester, source: requesterSource } = resolveRequester(args);
-  const subject = resolveMemorySubject(args, requester);
-  if (!subject.ok) return err(subject.message);
+    const { context: requester, source: requesterSource } = resolveRequester(args);
+    const subject = resolveMemorySubject(args, requester);
+    if (!subject.ok) return err(subject.message);
 
-  const result = await callGateway(runtime, '/memory/upsert', {
-    agent: agentBlock(runtime),
-    requester,
-    requesterSource,
-    namespace,
-    subject: subject.subject,
-    value,
-    merge: getBoolean(args, 'merge') ?? true,
-    context: getRecord(args, 'context') ?? {},
+    const result = await callGateway(runtime, '/memory/upsert', {
+      agent: agentBlock(runtime),
+      requester,
+      requesterSource,
+      namespace,
+      subject: subject.subject,
+      value,
+      merge: getBoolean(args, 'merge') ?? true,
+      context: getRecord(args, 'context') ?? {},
+    });
+    if (!result.ok) return err(result.message);
+    log(`erp_memory_upsert: ${namespace} for ${subject.subject.type}:${subject.subject.id} (${requesterSource})`);
+    return ok(result.text);
   });
-  if (!result.ok) return err(result.message);
-  log(`erp_memory_upsert: ${namespace} for ${subject.subject.type}:${subject.subject.id} (${requesterSource})`);
-  return ok(result.text);
 }
 
 export const erpDescribe: McpToolDefinition = {

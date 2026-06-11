@@ -29,11 +29,17 @@ import { markProgressStatusCompleted, markProgressStatusFailed } from './modules
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
-import { chainAttrs, outputAttrs } from './observability/openinference.js';
+import { chainAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
-import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
+import { BusinessTagKeys, SpanScope, applyBusinessTags } from './observability/business-tags.js';
 import { getActiveSpan } from './observability/tracer.js';
-import { clearSessionSpanContext, getSessionSpanContext, endSessionRootSpan } from './observability/context-bridge.js';
+import {
+  clearSessionSpanContext,
+  getSessionSpanContext,
+  endSessionRootSpan,
+  failSessionRootSpan,
+  updateSessionRootSpanTags,
+} from './observability/context-bridge.js';
 import { setSpanContextWithActive, context } from './observability/trace-context.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -57,6 +63,71 @@ const deliveryAttempts = new Map<string, number>();
  * second caller skips will be picked up on the next poll tick (~1s).
  */
 const inflightDeliveries = new Set<string>();
+
+interface DeliveryCompletion {
+  kind: 'answered' | 'delegated' | 'failed';
+  outputValue?: string;
+  tags: Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isUserVisibleOutbound(
+  msg: { kind: string; channel_type: string | null },
+  content: Record<string, unknown>,
+): boolean {
+  if (msg.kind === 'system' || msg.kind === 'llm-usage' || msg.channel_type === 'agent') return false;
+  if (content.operation === 'reaction' || content.operation === 'edit') return false;
+  if (content.type === 'ask_question' || content.type === 'card') return true;
+  if (typeof content.text === 'string' && content.text.trim().length > 0) return true;
+  if (typeof content.markdown === 'string' && content.markdown.trim().length > 0) return true;
+  if (Array.isArray(content.files) && content.files.length > 0) return true;
+  return false;
+}
+
+function deriveDeliveryCompletion(
+  msg: { kind: string; channel_type: string | null; platform_id: string | null },
+  content: Record<string, unknown>,
+): DeliveryCompletion | undefined {
+  if (msg.channel_type === 'agent') {
+    if (content._downstreamAnswerExpected === false) {
+      return {
+        kind: 'delegated',
+        tags: {
+          [BusinessTagKeys.TURN_RESULT]: 'delegated',
+          [BusinessTagKeys.DELEGATE_TO]: msg.platform_id ?? undefined,
+        },
+      };
+    }
+    return undefined;
+  }
+
+  if (!isUserVisibleOutbound(msg, content)) return undefined;
+
+  const text = typeof content.text === 'string' ? stripThinkTags(content.text) : undefined;
+  const markdown = typeof content.markdown === 'string' && content.markdown.trim().length > 0 ? content.markdown : undefined;
+
+  return {
+    kind: 'answered',
+    outputValue: text && text.length > 0 ? text : markdown,
+    tags: {
+      [BusinessTagKeys.TURN_RESULT]: 'answered',
+    },
+  };
+}
+
+function mergeCompletion(
+  current: DeliveryCompletion | undefined,
+  next: DeliveryCompletion | undefined,
+): DeliveryCompletion | undefined {
+  if (!next) return current;
+  if (!current) return next;
+  if (current.kind === 'answered') return current;
+  if (next.kind === 'answered') return next;
+  return next;
+}
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -201,7 +272,7 @@ async function drainSession(session: Session): Promise<void> {
 
   const drainFn = async () => {
     let handledOutbound = false;
-    let lastDeliveredText: string | undefined;
+    let completion: DeliveryCompletion | undefined;
 
     try {
       // Ensure platform_message_id column exists (migration for existing sessions)
@@ -220,18 +291,17 @@ async function drainSession(session: Session): Promise<void> {
           handledOutbound = true;
           deliveryAttempts.delete(msg.id);
 
-          if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-            try {
-              const parsed = JSON.parse(msg.content);
-              if (typeof parsed.text === 'string') {
-                lastDeliveredText = parsed.text;
-              }
-            } catch {
-              lastDeliveredText = msg.content;
-            }
+          let parsedContent: Record<string, unknown> | null = null;
+          try {
+            const parsed = JSON.parse(msg.content);
+            parsedContent = isRecord(parsed) ? parsed : null;
+          } catch {
+            parsedContent = null;
           }
 
-          if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+          completion = mergeCompletion(completion, parsedContent ? deriveDeliveryCompletion(msg, parsedContent) : undefined);
+
+          if (parsedContent && isUserVisibleOutbound(msg, parsedContent)) {
             await markProgressStatusCompleted(session.id, deliveryAdapter);
             pauseTypingRefreshAfterDelivery(session.id);
           }
@@ -248,7 +318,20 @@ async function drainSession(session: Session): Promise<void> {
             markDeliveryFailed(inDb, msg.id);
             handledOutbound = true;
             deliveryAttempts.delete(msg.id);
-            if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+            let parsedContent: Record<string, unknown> | null = null;
+            try {
+              const parsed = JSON.parse(msg.content);
+              parsedContent = isRecord(parsed) ? parsed : null;
+            } catch {
+              parsedContent = null;
+            }
+            if (parsedContent && isUserVisibleOutbound(msg, parsedContent)) {
+              completion = mergeCompletion(completion, {
+                kind: 'failed',
+                tags: {
+                  [BusinessTagKeys.TURN_RESULT]: 'failed',
+                },
+              });
               await markProgressStatusFailed(session.id, deliveryAdapter);
             }
           } else {
@@ -265,8 +348,13 @@ async function drainSession(session: Session): Promise<void> {
     } finally {
       outDb.close();
       inDb.close();
-      if (handledOutbound) {
-        endSessionRootSpan(session.id, lastDeliveredText);
+      if (handledOutbound && completion) {
+        updateSessionRootSpanTags(session.id, completion.tags);
+        if (completion.kind === 'failed') {
+          failSessionRootSpan(session.id, 'delivery failed');
+        } else {
+          endSessionRootSpan(session.id, completion.outputValue);
+        }
         clearSessionSpanContext(session.id);
       }
     }
@@ -280,19 +368,17 @@ async function drainSession(session: Session): Promise<void> {
 
   if (parentSpanContext) {
     await context.with(setSpanContextWithActive(parentSpanContext), async () => {
-      await withSpan('delivery.session.drain', spanAttrs, async () => {
+      await withSpan('platform.delivery.drain', spanAttrs, async () => {
         applyBusinessTags(getActiveSpan(), {
-          [BusinessTagKeys.LAYER]: 'platform',
-          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+          [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
         });
         await drainFn();
       });
     });
   } else {
-    await withSpan('delivery.session.drain', spanAttrs, async () => {
+    await withSpan('platform.delivery.drain', spanAttrs, async () => {
       applyBusinessTags(getActiveSpan(), {
-        [BusinessTagKeys.LAYER]: 'platform',
-        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
       });
       await drainFn();
     });
@@ -327,12 +413,11 @@ async function deliverMessage(
   inDb: Database.Database,
 ): Promise<string | undefined> {
   return withSpan(
-    'delivery.message.deliver',
+    'platform.delivery.message',
     chainAttrs({ 'msg.id': msg.id, 'message.kind': msg.kind }),
     async () => {
       applyBusinessTags(getActiveSpan(), {
-        [BusinessTagKeys.LAYER]: 'platform',
-        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
       });
     if (!deliveryAdapter) {
       log.warn('No delivery adapter configured, dropping message', { id: msg.id });
@@ -482,16 +567,14 @@ async function deliverMessage(
     }
 
     const platformMsgId = await withSpan(
-      'delivery.channel.send',
+      'platform.delivery.send',
       chainAttrs({
         'channel.type': msg.channel_type,
         'platform.id': msg.platform_id,
-        ...outputAttrs(typeof content === 'object' && typeof content.text === 'string' ? content.text : outboundContent),
       }),
       async () => {
         applyBusinessTags(getActiveSpan(), {
-          [BusinessTagKeys.LAYER]: 'platform',
-          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+          [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
         });
         return await deliveryAdapter!.deliver(
           msg.channel_type!,

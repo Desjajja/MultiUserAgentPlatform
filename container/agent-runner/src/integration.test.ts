@@ -351,7 +351,7 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('exports agent.turn after the first result even if the provider stream stays open', async () => {
+  it('exports platform.agent.turn after the first result even if the provider stream stays open', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'trace this turn' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
 
     const exporter = new CapturingSpanExporter();
@@ -364,20 +364,30 @@ describe('poll loop integration', () => {
     const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2500);
 
     await waitFor(() => getUndeliveredMessages().length > 0, 2500);
-    await waitFor(() => exporter.spans.some((span) => span.name === 'agent.turn'), 500);
+    await waitFor(() => exporter.spans.some((span) => span.name === 'platform.agent.turn'), 500);
 
     provider.abortActiveQuery();
     controller.abort();
     await loopPromise.catch(() => {});
 
-    expect(exporter.spans.some((span) => span.name === 'agent.turn')).toBe(true);
+    const turnSpan = exporter.spans.find((span) => span.name === 'platform.agent.turn');
+    expect(turnSpan).toBeDefined();
+    expect(turnSpan!.attributes['session.id']).toBeUndefined();
+    const metadata = JSON.parse(turnSpan!.attributes['metadata'] as string);
+    expect(metadata.span_scope).toBe('platform');
+    expect(metadata.component).toBe('agent');
+    expect(metadata.provider).toBe('mock');
+    expect(metadata.session_id).toBe('sess-test');
   });
 });
 
 class CapturingSpanExporter {
-  readonly spans: Array<{ name: string }> = [];
+  readonly spans: Array<{ name: string; attributes: Record<string, unknown> }> = [];
 
-  export(spans: Array<{ name: string }>, resultCallback: (result: { code: number }) => void): void {
+  export(
+    spans: Array<{ name: string; attributes: Record<string, unknown> }>,
+    resultCallback: (result: { code: number }) => void,
+  ): void {
     this.spans.push(...spans);
     resultCallback({ code: 0 });
   }
@@ -450,7 +460,7 @@ class CompactingProvider {
 /**
  * Provider that emits one result and then keeps its async iterator open until
  * the test aborts it. This matches the long-lived provider-session shape that
- * previously prevented agent.turn from ever ending.
+ * previously prevented platform.agent.turn from ever ending.
  */
 class ResultThenWaitProvider {
   readonly supportsNativeSlashCommands = false;
@@ -517,6 +527,7 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
       cwd: '/tmp',
       sessionId: 'sess-test',
       agentGroupId: 'agent-test',
+      routeType: 'frontdesk',
     }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));

@@ -27,6 +27,7 @@ import {
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { startAgentTurn } from './observability/turn-span.js';
+import { clearActiveTurnTraceparent, contextFromTraceparent, storeActiveTurnTraceparent } from './observability/init.js';
 import { clearRequestIdentity, getRequestIdentity, setRequestIdentity } from './request-context.js';
 import { resolveBatchIdentity, splitBatchByTurn } from './request-identity.js';
 
@@ -151,6 +152,7 @@ export interface PollLoopConfig {
   cwd: string;
   sessionId: string;
   agentGroupId: string;
+  routeType: string;
   systemContext?: {
     instructions?: string;
   };
@@ -162,6 +164,16 @@ export interface PollLoopConfig {
    * until host-sweep kills it at the absolute ceiling (30 min).
    */
   idleExitMs?: number;
+}
+
+export function selectTurnTraceparent(messages: MessageInRow[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const row = messages[index];
+    if (row.trigger === 1 && row.traceparent) {
+      return row.traceparent;
+    }
+  }
+  return null;
 }
 
 /**
@@ -359,15 +371,28 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // batch — not from "the latest inbound row at call time" — to avoid
     // cross-user misattribution in group/shared sessions.
     setRequestIdentity(resolveBatchIdentity(keep));
+    const activeTurnTraceparent = selectTurnTraceparent(turnMessages);
     const turnSpan = startAgentTurn({
       sessionId: config.sessionId,
       agentGroupId: config.agentGroupId,
       provider: config.providerName,
+      routeType: config.routeType,
+      parentContext: contextFromTraceparent(activeTurnTraceparent),
     });
     try {
-      const result = await processQuery(query, turnRouting, processingIds, config.providerName, {
-        onInitialTurnCompleted: () => turnSpan.complete(),
-      });
+      const result = await turnSpan.run(() =>
+        (async () => {
+          storeActiveTurnTraceparent();
+          try {
+            return await processQuery(query, turnRouting, processingIds, config.providerName, {
+              onInitialTurnCompleted: () => turnSpan.complete(),
+              activeTurnTraceparent,
+            });
+          } finally {
+            clearActiveTurnTraceparent();
+          }
+        })(),
+      );
       if (!result.initialTurnCompleted) {
         turnSpan.complete();
       }
@@ -471,9 +496,10 @@ interface QueryResult {
 
 interface ProcessQueryHooks {
   onInitialTurnCompleted?: () => void;
+  activeTurnTraceparent?: string | null;
 }
 
-async function processQuery(
+export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
@@ -589,6 +615,17 @@ async function processQuery(
           // re-claim them with the correct identity. markCompleted would
           // be wrong — they haven't been processed.
           releaseProcessing(keep.map((m) => m.id));
+          endedForCommand = true;
+          query.end();
+          return;
+        }
+
+        const hasNewTraceparent = keep.some(
+          (row) => !!row.traceparent && row.traceparent !== (hooks.activeTurnTraceparent ?? null),
+        );
+        if (hasNewTraceparent) {
+          log('Follow-up batch carries a new traceparent — ending stream so outer loop starts a fresh turn');
+          releaseProcessing(keep.map((row) => row.id));
           endedForCommand = true;
           query.end();
           return;
@@ -714,9 +751,9 @@ export function normalizeMessageBlocks(text: string): string {
     .replace(/<\s*\/\s*message\s*>/g, '</message>');
 }
 
-function dispatchResultText(text: string, routing: RoutingContext): void {
+export function dispatchResultText(text: string, routing: RoutingContext): void {
   const cleaned = normalizeMessageBlocks(text);
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const MESSAGE_RE = /<message\s+to="([^"]+)"[^>]*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -769,6 +806,25 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       const body = cleaned.trim();
       log(`Single-destination fallback: delivering ${body.length}B bare text to "${all[0].name}"`);
       sendToDestination(all[0], body, routing);
+      return;
+    }
+    // When the destination map wasn't projected (manual wiring, bootstrap gap),
+    // still deliver bare-text replies to the inbound routing surface. Host
+    // delivery permits origin-chat replies without agent_destinations rows.
+    if (routing.channelType && routing.platformId) {
+      const body = cleaned.trim();
+      log(
+        `Routing-context fallback: delivering ${body.length}B bare text to ${routing.channelType}/${routing.platformId}`,
+      );
+      writeMessageOut({
+        id: generateId(),
+        in_reply_to: routing.inReplyTo,
+        kind: 'chat',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId ?? null,
+        content: JSON.stringify({ text: body }),
+      });
       return;
     }
     const sample = text.replace(/\s+/g, ' ').slice(0, 200);

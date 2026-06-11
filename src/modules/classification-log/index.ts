@@ -17,6 +17,8 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { recordClassification, type ClassificationLogEntry } from '../../db/classification-log.js';
 import { log } from '../../log.js';
 import { classificationLogFailuresTotal, classificationsTotal } from '../../metrics.js';
+import { BusinessTagKeys } from '../../observability/business-tags.js';
+import { updateSessionRootSpanTags } from '../../observability/context-bridge.js';
 import type { Session } from '../../types.js';
 
 const ACTIONS: ReadonlyArray<ClassificationLogEntry['action']> = ['delegate', 'clarify', 'reject', 'answer_self'];
@@ -95,6 +97,14 @@ async function handleClassifyIntent(content: Record<string, unknown>, session: S
     log.error('classification_log write failed', { sessionId: session.id, err });
     return;
   }
+
+  updateSessionRootSpanTags(session.id, {
+    [BusinessTagKeys.CLASSIFY_ID]: entry.classificationId ?? undefined,
+    [BusinessTagKeys.SELECTED_AGENT]: entry.recommendedWorker ?? undefined,
+    [BusinessTagKeys.ROUTE_SCORE]: entry.confidence ?? undefined,
+    [BusinessTagKeys.AGENT_OPTIONS]: entry.candidates ?? undefined,
+    [BusinessTagKeys.ROUTE_REASON]: entry.reasoning?.slice(0, 500) ?? undefined,
+  });
 
   classificationsTotal.labels(action).inc();
 }

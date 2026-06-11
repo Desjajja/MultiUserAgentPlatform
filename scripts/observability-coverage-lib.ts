@@ -372,8 +372,8 @@ function parseMigrationRows(schema: string): MigrationRow[] {
     } satisfies MigrationRow;
   });
 
-  if (rows.length !== 11) {
-    throw new Error(`Expected exactly 11 migration rows in schema §7; found ${rows.length}`);
+  if (rows.length !== 9) {
+    throw new Error(`Expected exactly 9 migration rows in schema §7; found ${rows.length}`);
   }
 
   return rows;

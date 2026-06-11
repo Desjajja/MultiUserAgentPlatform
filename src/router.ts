@@ -21,7 +21,14 @@ import { getChannelAdapter } from './channels/channel-registry.js';
 import { SpanStatusCode } from '@opentelemetry/api';
 import { chainAttrs, runInDetachedRoot, rootInputAttrs } from './observability/openinference.js';
 import { withSpan } from './observability/with-span.js';
-import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
+import {
+  BusinessTagKeys,
+  SpanScope,
+  applyBusinessTags,
+  deriveRouteLabel,
+  interactionSpanName,
+  platformSpanName,
+} from './observability/business-tags.js';
 import { getActiveSpan } from './observability/tracer.js';
 import { storeSessionSpanContext, storeSessionRootSpan, failSessionRootSpan } from './observability/context-bridge.js';
 import { gateCommand } from './command-gate.js';
@@ -172,27 +179,33 @@ function isUserScopedSessionMode(
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
-  await runInDetachedRoot(() =>
+  const endTimer = startTimer('route');
+  try {
+    await routeInboundInner(event);
+    inboundTotal.labels(event.channelType, 'accepted').inc();
+  } catch (err) {
+    inboundTotal.labels(event.channelType, 'rejected').inc();
+    throw err;
+  } finally {
+    endTimer();
+  }
+}
+
+async function withRouterDiagnosticSpan<T>(
+  action: 'drop' | 'deny',
+  channelType: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return runInDetachedRoot(() =>
     withSpan(
-      'router.route',
-      chainAttrs({ 'channel.type': event.channelType || 'unknown' }),
+      platformSpanName('router', action),
+      chainAttrs({ 'channel.type': channelType || 'unknown' }),
       async () => {
         applyBusinessTags(getActiveSpan(), {
-          [BusinessTagKeys.LAYER]: 'platform',
-          [BusinessTagKeys.ROUTE_TYPE]: 'frontdesk',
-          [BusinessTagKeys.LANE]: 'frontdesk',
-          [BusinessTagKeys.CHANNEL]: event.channelType || 'unknown',
+          [BusinessTagKeys.SPAN_SCOPE]: SpanScope.ROUTING,
+          [BusinessTagKeys.CHANNEL]: channelType || 'unknown',
         });
-        const endTimer = startTimer('route');
-        try {
-          await routeInboundInner(event);
-          inboundTotal.labels(event.channelType, 'accepted').inc();
-        } catch (err) {
-          inboundTotal.labels(event.channelType, 'rejected').inc();
-          throw err;
-        } finally {
-          endTimer();
-        }
+        return fn();
       },
     ),
   );
@@ -257,39 +270,43 @@ async function routeInboundInner(event: InboundEvent): Promise<void> {
   if (agentCount === 0) {
     if (!isMention) return;
     if (mg.denied_at) {
-      log.debug('Message dropped — channel was denied by owner', {
-        messagingGroupId: mg.id,
-        deniedAt: mg.denied_at,
+      await withRouterDiagnosticSpan('deny', event.channelType, async () => {
+        log.debug('Message dropped — channel was denied by owner', {
+          messagingGroupId: mg.id,
+          deniedAt: mg.denied_at,
+        });
       });
       return;
     }
 
     const parsed = safeParseContent(event.message.content);
-    recordDroppedMessage({
-      channel_type: event.channelType,
-      platform_id: event.platformId,
-      user_id: null,
-      sender_name: parsed.sender ?? null,
-      reason: 'no_agent_wired',
-      messaging_group_id: mg.id,
-      agent_group_id: null,
-    });
-
-    if (channelRequestGate) {
-      // Fire-and-forget escalation. The gate is expected to build a card,
-      // persist pending_channel_approvals, and replay the event via
-      // routeInbound after approval. Errors are logged internally — the
-      // user's message still stays dropped here either way.
-      void channelRequestGate(mg, event).catch((err) =>
-        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err }),
-      );
-    } else {
-      log.warn('MESSAGE DROPPED — no agent groups wired and no channel-request gate registered', {
-        messagingGroupId: mg.id,
-        channelType: event.channelType,
-        platformId: event.platformId,
+    await withRouterDiagnosticSpan('drop', event.channelType, async () => {
+      recordDroppedMessage({
+        channel_type: event.channelType,
+        platform_id: event.platformId,
+        user_id: null,
+        sender_name: parsed.sender ?? null,
+        reason: 'no_agent_wired',
+        messaging_group_id: mg.id,
+        agent_group_id: null,
       });
-    }
+
+      if (channelRequestGate) {
+        // Fire-and-forget escalation. The gate is expected to build a card,
+        // persist pending_channel_approvals, and replay the event via
+        // routeInbound after approval. Errors are logged internally — the
+        // user's message still stays dropped here either way.
+        void channelRequestGate(mg, event).catch((err) =>
+          log.error('Channel-request gate threw', { messagingGroupId: mg.id, err }),
+        );
+      } else {
+        log.warn('MESSAGE DROPPED — no agent groups wired and no channel-request gate registered', {
+          messagingGroupId: mg.id,
+          channelType: event.channelType,
+          platformId: event.platformId,
+        });
+      }
+    });
     return;
   }
 
@@ -319,6 +336,7 @@ async function routeInboundInner(event: InboundEvent): Promise<void> {
 
   let engagedCount = 0;
   let accumulatedCount = 0;
+  let deniedCount = 0;
   let subscribed = false;
 
   for (const agent of agents) {
@@ -346,6 +364,10 @@ async function routeInboundInner(event: InboundEvent): Promise<void> {
     const accessOk =
       engages && sessionIdentityOk && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
+
+    if (engages && sessionIdentityOk && (!accessOk || !scopeOk)) {
+      deniedCount++;
+    }
 
     if (engages && accessOk && scopeOk) {
       await deliverToAgent(agent, agentGroup, mg, event, userId, effectiveSessionMode, true);
@@ -397,14 +419,16 @@ async function routeInboundInner(event: InboundEvent): Promise<void> {
   }
 
   if (engagedCount + accumulatedCount === 0) {
-    recordDroppedMessage({
-      channel_type: event.channelType,
-      platform_id: event.platformId,
-      user_id: userId,
-      sender_name: parsed.sender ?? null,
-      reason: 'no_agent_engaged',
-      messaging_group_id: mg.id,
-      agent_group_id: null,
+    await withRouterDiagnosticSpan(deniedCount > 0 ? 'deny' : 'drop', event.channelType, async () => {
+      recordDroppedMessage({
+        channel_type: event.channelType,
+        platform_id: event.platformId,
+        user_id: userId,
+        sender_name: parsed.sender ?? null,
+        reason: 'no_agent_engaged',
+        messaging_group_id: mg.id,
+        agent_group_id: null,
+      });
     });
   }
 }
@@ -506,26 +530,78 @@ async function deliverToAgent(
 ): Promise<void> {
   const parsed = safeParseContent(event.message.content);
   const inputText = parsed.text ?? event.message.content;
+  const routeLabel = deriveRouteLabel(agentGroup.folder);
+  const deliveryAddr = event.replyTo ?? {
+    channelType: event.channelType,
+    platformId: event.platformId,
+    threadId: event.threadId,
+  };
+
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+    if (gate.action === 'filter') {
+      await withRouterDiagnosticSpan('drop', event.channelType, async () => {
+        log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+      });
+      return;
+    }
+    if (gate.action === 'deny') {
+      await withRouterDiagnosticSpan('deny', event.channelType, async () => {
+        const { session } = resolveSession(
+          agent.agent_group_id,
+          mg.id,
+          event.threadId,
+          effectiveSessionMode,
+          userId,
+        );
+        const ok = writeOutboundDirect(session.agent_group_id, session.id, {
+          id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          platformId: deliveryAddr.platformId,
+          channelType: deliveryAddr.channelType,
+          threadId: deliveryAddr.threadId,
+          content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
+          inReplyTo: event.message.id,
+        });
+        if (!ok) {
+          log.warn('Admin deny response dropped (outbound.db busy)', {
+            command: gate.command,
+            userId,
+            agentGroupId: agent.agent_group_id,
+          });
+        } else {
+          log.info('Admin command denied by gate', {
+            command: gate.command,
+            userId,
+            agentGroupId: agent.agent_group_id,
+          });
+        }
+      });
+      return;
+    }
+  }
 
   await runInDetachedRoot(() => {
     const tracer = getTracer();
 
-      return tracer.startActiveSpan(
-        'router.deliver_to_agent',
-        { attributes: rootInputAttrs({
+    return tracer.startActiveSpan(
+      interactionSpanName(routeLabel),
+      {
+        attributes: rootInputAttrs({
           sessionId: '',
           userId: userId ?? undefined,
           inputValue: inputText,
-        }) as import('@opentelemetry/api').Attributes },
-        async (rootSpan) => {
-          try {
-            applyBusinessTags(rootSpan, {
-              [BusinessTagKeys.LAYER]: 'ai',
-              [BusinessTagKeys.ROUTE_TYPE]: 'frontdesk',
-              [BusinessTagKeys.LANE]: 'frontdesk',
-              [BusinessTagKeys.CHANNEL]: event.channelType || 'unknown',
-              [BusinessTagKeys.INTENT]: 'chat',
-            });
+        }) as import('@opentelemetry/api').Attributes,
+      },
+      async (rootSpan) => {
+        try {
+          applyBusinessTags(rootSpan, {
+            [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+            [BusinessTagKeys.ROUTE_LABEL]: routeLabel,
+            [BusinessTagKeys.ENTRYPOINT]: 'chat',
+            [BusinessTagKeys.CHANNEL]: event.channelType || 'unknown',
+            [BusinessTagKeys.INTENT]: 'chat',
+          });
           if (isUserScopedSessionMode(effectiveSessionMode) && !userId) {
             throw new Error(`userId is required for session_mode=${effectiveSessionMode}`);
           }
@@ -540,47 +616,13 @@ async function deliverToAgent(
 
           rootSpan.setAttribute('session.id', session.id);
           rootSpan.setAttribute('agent.group.id', agent.agent_group_id);
-          rootSpan.setAttribute('muap.agent_group', agentGroup.name);
-          rootSpan.setAttribute('muap.session_mode', effectiveSessionMode);
-          rootSpan.setAttribute('muap.engage_mode', (session.spawn_depth ?? 0) > 0 ? 'a2a' : 'direct');
+          applyBusinessTags(rootSpan, {
+            [BusinessTagKeys.AGENT_GROUP]: agentGroup.name,
+            [BusinessTagKeys.SESSION_MODE]: effectiveSessionMode,
+            [BusinessTagKeys.ENGAGE_MODE]: (session.spawn_depth ?? 0) > 0 ? 'a2a' : 'direct',
+            [BusinessTagKeys.ACCESS_RESULT]: 'allow',
+          });
           storeSessionSpanContext(session.id, rootSpan.spanContext());
-
-          const deliveryAddr = event.replyTo ?? {
-            channelType: event.channelType,
-            platformId: event.platformId,
-            threadId: event.threadId,
-          };
-
-          if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-            const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
-            if (gate.action === 'filter') {
-              log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
-              rootSpan.end();
-              return;
-            }
-            if (gate.action === 'deny') {
-              const ok = writeOutboundDirect(session.agent_group_id, session.id, {
-                id: `deny-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                kind: 'chat',
-                platformId: deliveryAddr.platformId,
-                channelType: deliveryAddr.channelType,
-                threadId: deliveryAddr.threadId,
-                content: JSON.stringify({ text: `Permission denied: ${gate.command} requires admin access.` }),
-                inReplyTo: event.message.id,
-              });
-              if (!ok) {
-                log.warn('Admin deny response dropped (outbound.db busy)', {
-                  command: gate.command,
-                  userId,
-                  agentGroupId: agent.agent_group_id,
-                });
-              } else {
-                log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
-              }
-              rootSpan.end();
-              return;
-            }
-          }
 
           writeSessionMessage(session.agent_group_id, session.id, {
             id: messageIdForAgent(event.message.id, agent.agent_group_id),

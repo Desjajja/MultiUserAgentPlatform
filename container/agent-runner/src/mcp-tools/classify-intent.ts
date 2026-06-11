@@ -20,6 +20,7 @@
 import { setCurrentClassificationId } from '../current-batch.js';
 import { findByName } from '../destinations.js';
 import { writeMessageOut } from '../db/messages-out.js';
+import { startToolSpan } from '../observability/tool-span.js';
 import { getRequestIdentity } from '../request-context.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -128,97 +129,79 @@ export const classifyIntent: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const userMessage = typeof args.userMessage === 'string' ? args.userMessage : '';
-    const recommendedWorker =
-      typeof args.recommendedWorker === 'string' && args.recommendedWorker.length > 0 ? args.recommendedWorker : null;
-    const confidenceRaw = args.confidence;
-    const confidence =
-      typeof confidenceRaw === 'number' && Number.isFinite(confidenceRaw) ? confidenceRaw : Number.NaN;
-    const candidatesRaw = args.candidates;
-    const candidates = Array.isArray(candidatesRaw)
-      ? candidatesRaw.filter((c): c is string => typeof c === 'string' && c.length > 0)
-      : [];
-    const reasoning = typeof args.reasoning === 'string' ? args.reasoning : null;
-    const actionRaw = args.action;
-    const action =
-      typeof actionRaw === 'string' && ['delegate', 'clarify', 'reject', 'answer_self'].includes(actionRaw)
-        ? (actionRaw as 'delegate' | 'clarify' | 'reject' | 'answer_self')
-        : null;
-    if (!action) return err('action must be one of delegate | clarify | reject | answer_self');
-    if (!userMessage) return err('userMessage is required');
-    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-      return err('confidence must be a finite number in [0, 1]');
-    }
-    // Validate recommendedWorker against the local destinations table
-    // when it's declared: the prompt already told the LLM to use only
-    // real destination names, but nothing enforced it — random strings
-    // would pollute the regression corpus as "delegate to finace-worke"
-    // typos. delegate / clarify without a destination-backed
-    // recommendation are still allowed (the LLM may genuinely not pick
-    // one yet); reject / answer_self naturally have no worker.
-    if (recommendedWorker) {
-      const dest = findByName(recommendedWorker);
-      if (!dest || dest.type !== 'agent') {
-        return err(
-          `recommendedWorker "${recommendedWorker}" is not a known agent destination. Use one of your configured worker names, or omit this field if you won't be delegating.`,
+    return startToolSpan(
+      {
+        spanName: 'mcp.classify',
+        toolName: 'classify_intent',
+        toolParameters: args,
+        toolGroup: 'mcp',
+      },
+      async () => {
+        const userMessage = typeof args.userMessage === 'string' ? args.userMessage : '';
+        const recommendedWorker =
+          typeof args.recommendedWorker === 'string' && args.recommendedWorker.length > 0
+            ? args.recommendedWorker
+            : null;
+        const confidenceRaw = args.confidence;
+        const confidence =
+          typeof confidenceRaw === 'number' && Number.isFinite(confidenceRaw) ? confidenceRaw : Number.NaN;
+        const candidatesRaw = args.candidates;
+        const candidates = Array.isArray(candidatesRaw)
+          ? candidatesRaw.filter((c): c is string => typeof c === 'string' && c.length > 0)
+          : [];
+        const reasoning = typeof args.reasoning === 'string' ? args.reasoning : null;
+        const actionRaw = args.action;
+        const action =
+          typeof actionRaw === 'string' && ['delegate', 'clarify', 'reject', 'answer_self'].includes(actionRaw)
+            ? (actionRaw as 'delegate' | 'clarify' | 'reject' | 'answer_self')
+            : null;
+        if (!action) return err('action must be one of delegate | clarify | reject | answer_self');
+        if (!userMessage) return err('userMessage is required');
+        if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+          return err('confidence must be a finite number in [0, 1]');
+        }
+        if (recommendedWorker) {
+          const dest = findByName(recommendedWorker);
+          if (!dest || dest.type !== 'agent') {
+            return err(
+              `recommendedWorker "${recommendedWorker}" is not a known agent destination. Use one of your configured worker names, or omit this field if you won't be delegating.`,
+            );
+          }
+        }
+
+        const identity = getRequestIdentity();
+        const classificationId = generateClassificationId();
+        const distinctCandidates = Array.from(new Set([...(recommendedWorker ? [recommendedWorker] : []), ...candidates]));
+
+        writeMessageOut({
+          id: generateId(),
+          kind: 'system',
+          content: JSON.stringify({
+            action: 'classify_intent',
+            classificationId,
+            userId: identity?.userId ?? null,
+            channelType: identity?.channelType ?? null,
+            platformId: identity?.platformId ?? null,
+            threadId: identity?.threadId ?? null,
+            userMessage: userMessage.slice(0, 500),
+            recommendedWorker,
+            confidence,
+            candidates: distinctCandidates,
+            reasoning,
+            action_taken: action,
+          }),
+        });
+
+        setCurrentClassificationId(classificationId);
+
+        const advisory = confidenceAdvisory(confidence, distinctCandidates.length);
+        log(
+          `classify_intent: id=${classificationId} worker=${recommendedWorker ?? 'none'} conf=${confidence.toFixed(2)} action=${action}`,
         );
-      }
-    }
-
-    const identity = getRequestIdentity();
-    const classificationId = generateClassificationId();
-
-    // De-duplicate candidates so a reviewer counting "multiple plausible
-    // workers" can't be fooled by the LLM listing recommendedWorker both
-    // as top pick and in the candidates array. This also tightens the
-    // confidenceAdvisory() branch that triggers on > 1 candidates.
-    const distinctCandidates = Array.from(
-      new Set([...(recommendedWorker ? [recommendedWorker] : []), ...candidates]),
-    );
-
-    writeMessageOut({
-      id: generateId(),
-      kind: 'system',
-      content: JSON.stringify({
-        action: 'classify_intent',
-        classificationId,
-        userId: identity?.userId ?? null,
-        // Preserve the full channel/thread context on the audit row.
-        // Without these, later analytics can't slice "what did
-        // frontdesk classify in this thread / this channel" without
-        // awkward joins.
-        channelType: identity?.channelType ?? null,
-        platformId: identity?.platformId ?? null,
-        threadId: identity?.threadId ?? null,
-        userMessage: userMessage.slice(0, 500),
-        recommendedWorker,
-        confidence,
-        candidates: distinctCandidates,
-        reasoning,
-        action_taken: action,
-      }),
-    });
-
-    // Publish to per-turn state so final <message to="..."> dispatch
-    // can auto-stamp the outbound row. LLMs can't embed the id into
-    // the XML form, so without this, every delegation via the main
-    // <message> protocol would bypass the classification audit loop.
-    // Last-write-wins is fine: multiple classify_intent calls in one
-    // turn mean the agent re-classified, and only the latest view
-    // should be attributed to the eventual send.
-    setCurrentClassificationId(classificationId);
-
-    const advisory = confidenceAdvisory(confidence, distinctCandidates.length);
-    log(
-      `classify_intent: id=${classificationId} worker=${recommendedWorker ?? 'none'} conf=${confidence.toFixed(2)} action=${action}`,
-    );
-    // Return structure instead of a plain string. The advisory stays at
-    // the top for natural-language salience; the id is informational —
-    // the agent does NOT need to remember or re-pass it because the
-    // runner auto-attaches it to subsequent outbound (including the
-    // final <message to="..."> XML path, which has no explicit arg).
-    return ok(
-      `${advisory}\n\nclassificationId: ${classificationId} (auto-attached to your next outbound; you don't need to quote it back).`,
+        return ok(
+          `${advisory}\n\nclassificationId: ${classificationId} (auto-attached to your next outbound; you don't need to quote it back).`,
+        );
+      },
     );
   },
 };

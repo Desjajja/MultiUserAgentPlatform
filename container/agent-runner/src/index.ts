@@ -26,8 +26,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { initContainerOTel } from './observability/init.js';
+import { validateRouteType } from './observability/metadata.js';
 import { loadConfig } from './config.js';
-import { buildSystemPromptAddendum } from './destinations.js';
+import { buildSystemInstructions } from './group-prompt.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -44,19 +45,32 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
 
-  const sessionId = process.env.FRONTLANE_SESSION_ID || 'unknown';
+  // Host always injects FRONTLANE_SESSION_ID (src/container-runner.ts).
+  // A missing value means the container was launched outside the host
+  // pipeline (manual `docker run`, broken host code path) — log loudly so
+  // the regression is visible in stderr instead of silently emitting
+  // `session.id='unknown'` traces. Still fall back so the container runs.
+  const rawSessionId = process.env.FRONTLANE_SESSION_ID;
+  if (!rawSessionId) {
+    log('WARNING: FRONTLANE_SESSION_ID not set — host did not inject it. Spans will report session.id=unknown.');
+  }
+  const sessionId = rawSessionId || 'unknown';
+
+  const routeType = validateRouteType(process.env.FRONTLANE_ROUTE_TYPE);
+
   initContainerOTel(sessionId);
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
-  // Runtime-generated system-prompt addendum: agent identity, memory
-  // policy, and the live destinations map. Everything else (capabilities,
-  // per-module instructions, per-channel formatting) is loaded by Claude
-  // Code from /workspace/agent/CLAUDE.md — the composed entry imports the
-  // shared base (/app/CLAUDE.md) and each enabled module's fragment.
-  // Per-group memory lives in /workspace/agent/CLAUDE.local.md
-  // (auto-loaded) when the selected provider supports it.
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined, config.memoryMode);
+  // System prompt: per-group CLAUDE.local.md (non-claude providers) plus
+  // runtime addendum (destinations, ERP memory policy; identity only when
+  // no local prompt). Claude Code auto-loads CLAUDE.local.md from cwd via SDK.
+  const instructions = buildSystemInstructions({
+    cwd: CWD,
+    provider: providerName,
+    assistantName: config.assistantName || undefined,
+    memoryMode: config.memoryMode,
+  });
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
@@ -102,8 +116,9 @@ async function main(): Promise<void> {
     provider,
     providerName,
     cwd: CWD,
-    sessionId: process.env.FRONTLANE_SESSION_ID || 'unknown',
+    sessionId,
     agentGroupId: config.agentGroupId,
+    routeType,
     systemContext: { instructions },
     idleExitMs: config.idleExitMs,
   });

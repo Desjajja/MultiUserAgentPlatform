@@ -1,9 +1,13 @@
 import crypto from 'node:crypto';
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { propagation, ROOT_CONTEXT, trace } from '@opentelemetry/api';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import { NodeTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
 
 import type { EnterpriseGatewayConfig } from '../config.js';
 import { closeSessionDb, getOutboundDb, initTestSessionDb } from '../db/connection.js';
+import { startAgentTurn } from '../observability/turn-span.js';
 import {
   clearRequestIdentity,
   setRequestIdentity,
@@ -17,6 +21,23 @@ import {
   handleErpMemoryGet,
   handleErpMemoryUpsert,
 } from './erp-gateway.js';
+
+class CapturingExporter {
+  readonly spans: Array<{ name: string; attributes: Record<string, unknown> }> = [];
+
+  export(
+    spans: ReadonlyArray<{ name: string; attributes?: Record<string, unknown> }>,
+    cb: (r: { code: number }) => void,
+  ): void {
+    for (const span of spans) {
+      this.spans.push({ name: span.name, attributes: { ...(span.attributes ?? {}) } });
+    }
+    cb({ code: 0 });
+  }
+
+  async shutdown(): Promise<void> {}
+  async forceFlush(): Promise<void> {}
+}
 
 const runtime = {
   assistantName: 'Frontdesk',
@@ -412,5 +433,51 @@ describe('erp gateway mcp tools', () => {
 
     expect(capturedHeaders['x-custom-sig']).toMatch(/^[0-9a-f]{64}$/);
     expect(capturedHeaders['x-frontlane-signature']).toBeUndefined();
+  });
+
+  it('emits a TOOL span with ERP metadata and official fields', async () => {
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+    trace.disable();
+    const exporter = new CapturingExporter();
+    const provider = new NodeTracerProvider();
+    provider.addSpanProcessor(new SimpleSpanProcessor(exporter as never));
+    provider.register();
+
+    setRequestIdentity(sessionIdentity());
+    globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch;
+
+    const turn = startAgentTurn({
+      sessionId: 'sess-erp-span',
+      agentGroupId: 'ag-frontdesk',
+      provider: 'mock',
+      routeType: 'frontdesk',
+      parentContext: propagation.extract(ROOT_CONTEXT, {
+        traceparent: '00-0123456789abcdef0123456789abcdef-bbbbbbbbbbbbbbbb-01',
+      }),
+    });
+
+    await turn.run(async () => {
+      await handleErpExecute(configuredRuntime({ baseUrl: 'https://erp-gateway.example' }), {
+        operation: 'finance.invoice.approve',
+        input: { invoiceId: 'INV-001' },
+      });
+    });
+    turn.complete();
+
+    const span = exporter.spans.find((entry) => entry.name === 'mcp.erp');
+    expect(span).toBeDefined();
+    expect(span!.attributes['openinference.span.kind']).toBe('TOOL');
+    expect(span!.attributes['tool.name']).toBe('erp_execute');
+    expect(JSON.parse(String(span!.attributes['tool.parameters']))).toMatchObject({
+      operation: 'finance.invoice.approve',
+      input: { invoiceId: 'INV-001' },
+    });
+    const metadata = JSON.parse(String(span!.attributes.metadata)) as Record<string, unknown>;
+    expect(metadata.span_scope).toBe('tool');
+    expect(metadata.tool_group).toBe('mcp');
+    expect(metadata.biz_domain).toBe('erp');
+    expect(metadata.erp_op).toBe('finance.invoice.approve');
+
+    trace.disable();
   });
 });

@@ -144,16 +144,18 @@ export function insertMessage(
      * content payload's senderId).
      */
     originUserId?: string | null;
+    traceparent?: string | null;
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, origin_user_id)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @originUserId)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, origin_user_id, traceparent)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @originUserId, @traceparent)`,
   ).run({
     ...message,
     trigger: message.trigger ?? 1,
     sourceSessionId: message.sourceSessionId ?? null,
     originUserId: message.originUserId ?? null,
+    traceparent: message.traceparent ?? null,
     seq: nextEvenSeq(db),
   });
 }
@@ -363,6 +365,9 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // agent-asserted identity. NULL on channel-side inbound (where the
     // user id is already in the content payload) and on pre-migration rows.
     db.prepare('ALTER TABLE messages_in ADD COLUMN origin_user_id TEXT').run();
+  }
+  if (!cols.has('traceparent')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN traceparent TEXT').run();
   }
 }
 

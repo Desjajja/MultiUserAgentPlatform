@@ -34,7 +34,7 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { chainAttrs } from './observability/openinference.js';
 import { getActiveSpan } from './observability/tracer.js';
 import { withSpan } from './observability/with-span.js';
-import { BusinessTagKeys, applyBusinessTags } from './observability/business-tags.js';
+import { BusinessTagKeys, SpanScope, RouteType, applyBusinessTags, deriveRouteType } from './observability/business-tags.js';
 import { injectTraceContext } from './observability/trace-context.js';
 import { failSessionRootSpan } from './observability/context-bridge.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -86,6 +86,19 @@ export function isContainerRunning(sessionId: string): boolean {
 }
 
 /**
+ * Resolve the lane (`frontdesk`/`worker`) for an agent group id by reading
+ * the group's folder. Used by `container.wake/spawn/kill` platform spans so
+ * they tag with the same `route_type` the container's own `agent.turn` will
+ * carry — without this, the host span tree mislabels frontdesk container
+ * lifecycle events as `worker`. Falls back to `'system'` when the group is
+ * gone (deleted mid-flight, kill arriving after teardown).
+ */
+function laneForSession(agentGroupId: string): RouteType {
+  const group = getAgentGroup(agentGroupId);
+  return group ? deriveRouteType(group.folder) : RouteType.SYSTEM;
+}
+
+/**
  * Decide whether a new wake should be admitted. Pure function so tests
  * don't have to mock the whole spawn pipeline. The cap is `>=` against
  * (active + in-flight), because an in-flight wake is about to become an
@@ -114,12 +127,11 @@ export function shouldAdmitWake(args: { activeCount: number; inflightCount: numb
  */
 export function wakeContainer(session: Session): Promise<boolean> {
     return withSpan(
-      'container.wake',
+      'platform.container.wake',
       chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
       async () => {
         applyBusinessTags(getActiveSpan(), {
-          [BusinessTagKeys.LAYER]: 'platform',
-          [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+          [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
         });
       if (activeContainers.has(session.id)) {
         log.debug('Container already running', { sessionId: session.id });
@@ -163,12 +175,11 @@ export function wakeContainer(session: Session): Promise<boolean> {
 
 async function spawnContainer(session: Session): Promise<void> {
   return withSpan(
-    'container.spawn',
+    'platform.container.spawn',
     chainAttrs({ 'session.id': session.id, 'agent.group.id': session.agent_group_id }),
     async () => {
       applyBusinessTags(getActiveSpan(), {
-        [BusinessTagKeys.LAYER]: 'platform',
-        [BusinessTagKeys.ROUTE_TYPE]: 'worker',
+        [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
       });
     const agentGroup = getAgentGroup(session.agent_group_id);
     if (!agentGroup) {
@@ -214,12 +225,30 @@ async function spawnContainer(session: Session): Promise<void> {
       agentIdentifier,
     );
 
-    // Inject OTEL_TRACEPARENT so the container can continue the trace context
+    // Inject OTEL_TRACEPARENT so the container can continue the trace context.
+    // These flags MUST land before --entrypoint/<image> in the docker arg list,
+    // otherwise docker treats them as args to the entrypoint shell instead of
+    // env vars on the container. buildContainerArgs already terminated with
+    // --entrypoint + image + -c, so we splice in before --entrypoint.
+    const envFlags: string[] = [];
     const carrier: Record<string, string> = {};
     injectTraceContext(carrier);
     if (carrier.traceparent) {
-      args.push('-e', `OTEL_TRACEPARENT=${carrier.traceparent}`);
+      envFlags.push('-e', `OTEL_TRACEPARENT=${carrier.traceparent}`);
     }
+    // Propagate route-type + session id so the container's `agent.turn` span
+    // reports the real lane instead of a hardcoded value.
+    envFlags.push('-e', `FRONTLANE_ROUTE_TYPE=${deriveRouteType(agentGroup.folder)}`);
+    envFlags.push('-e', `FRONTLANE_SESSION_ID=${session.id}`);
+
+    const entrypointIdx = args.indexOf('--entrypoint');
+    if (entrypointIdx === -1) {
+      // Defensive: buildContainerArgs always sets --entrypoint, so this should
+      // be unreachable. If it ever is, fail loud rather than silently dropping
+      // env vars onto the entrypoint argv (the bug we just fixed).
+      throw new Error('container args missing --entrypoint anchor; cannot splice env vars safely');
+    }
+    args.splice(entrypointIdx, 0, ...envFlags);
 
     log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -277,12 +306,12 @@ async function spawnContainer(session: Session): Promise<void> {
 
 /** Kill a container for a session. */
 export async function killContainer(sessionId: string, reason: string): Promise<void> {
-  await withSpan('container.kill', chainAttrs({ 'session.id': sessionId, reason }), async () => {
-    applyBusinessTags(getActiveSpan(), {
-      [BusinessTagKeys.LAYER]: 'platform',
-      [BusinessTagKeys.ROUTE_TYPE]: 'worker',
-    });
+  await withSpan('platform.container.kill', chainAttrs({ reason }), async () => {
     const entry = activeContainers.get(sessionId);
+    applyBusinessTags(getActiveSpan(), {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.PLATFORM,
+      [BusinessTagKeys.SESSION_ID]: sessionId,
+    });
     if (!entry) return;
 
     log.info('Killing container', { sessionId, reason, containerName: entry.containerName });

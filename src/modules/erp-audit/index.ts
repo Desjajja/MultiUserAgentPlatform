@@ -12,6 +12,8 @@
 import { registerDeliveryAction } from '../../delivery.js';
 import { recordErpAudit, type ErpAuditEntry } from '../../db/erp-audit.js';
 import { log } from '../../log.js';
+import { BusinessTagKeys } from '../../observability/business-tags.js';
+import { updateSessionRootSpanTags } from '../../observability/context-bridge.js';
 import type { Session } from '../../types.js';
 
 function readString(content: Record<string, unknown>, key: string): string | undefined {
@@ -59,7 +61,14 @@ async function handleErpAudit(content: Record<string, unknown>, session: Session
     recordErpAudit(entry);
   } catch (err) {
     log.error('erp_audit row write failed', { sessionId: session.id, err });
+    return;
   }
+
+  updateSessionRootSpanTags(session.id, {
+    [BusinessTagKeys.USED_ERP]: true,
+    [BusinessTagKeys.BIZ_DOMAIN]: 'erp',
+    [BusinessTagKeys.ERP_OP]: entry.operation ?? undefined,
+  });
 }
 
 registerDeliveryAction('erp_audit', handleErpAudit);

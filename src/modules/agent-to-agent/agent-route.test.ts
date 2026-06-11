@@ -3,12 +3,17 @@ import fs from 'fs';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
+import { BusinessTagKeys, RouteLabel, SpanScope, applyBusinessTags } from '../../observability/business-tags.js';
+import { getSessionRootSpan, storeSessionRootSpan } from '../../observability/context-bridge.js';
+import * as tracerModule from '../../observability/tracer.js';
 import { isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
 import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
-import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { initSessionFolder, openInboundDb, openOutboundDb, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import type { Span, SpanContext } from '@opentelemetry/api';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -39,10 +44,12 @@ function writeGroupConfig(folder: string, config: Record<string, unknown>): void
 }
 
 function readInbound(agentGroupId: string, sessionId: string) {
-  const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
+  const db = openInboundDb(agentGroupId, sessionId);
+  const columns = new Set((db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name));
+  const traceparentExpr = columns.has('traceparent') ? 'traceparent' : 'NULL as traceparent';
   const rows = db
     .prepare(
-      'SELECT id, platform_id, channel_type, content, source_session_id, origin_user_id FROM messages_in ORDER BY seq',
+      `SELECT id, platform_id, channel_type, content, source_session_id, origin_user_id, ${traceparentExpr} FROM messages_in ORDER BY seq`,
     )
     .all() as Array<{
     id: string;
@@ -51,9 +58,85 @@ function readInbound(agentGroupId: string, sessionId: string) {
     content: string;
     source_session_id: string | null;
     origin_user_id: string | null;
+    traceparent: string | null;
   }>;
   db.close();
   return rows;
+}
+
+function readOutbound(agentGroupId: string, sessionId: string) {
+  const db = openOutboundDb(agentGroupId, sessionId);
+  const rows = db
+    .prepare('SELECT id, platform_id, channel_type, thread_id, content, in_reply_to FROM messages_out ORDER BY seq')
+    .all() as Array<{
+    id: string;
+    platform_id: string | null;
+    channel_type: string | null;
+    thread_id: string | null;
+    content: string;
+    in_reply_to: string | null;
+  }>;
+  db.close();
+  return rows;
+}
+
+function makeRootSpan(
+  name = 'interaction.frontdesk',
+  spanContext: SpanContext = {
+    traceId: '0123456789abcdef0123456789abcdef',
+    spanId: 'fedcba9876543210',
+    traceFlags: 1,
+    isRemote: false,
+  },
+): Span & {
+  attributes: Record<string, unknown>;
+  ended: boolean;
+  name: string;
+} {
+  type FakeRootSpan = Span & {
+    attributes: Record<string, unknown>;
+    ended: boolean;
+    name: string;
+  };
+  return {
+    name,
+    attributes: {},
+    ended: false,
+    spanContext: () => spanContext,
+    setAttribute(this: FakeRootSpan, key: string, value: unknown) {
+      this.attributes[key] = value;
+      return this;
+    },
+    setAttributes(this: FakeRootSpan, attrs: Record<string, unknown>) {
+      Object.assign(this.attributes, attrs);
+      return this;
+    },
+    setStatus() {
+      return this;
+    },
+    updateName(this: FakeRootSpan, nextName: string) {
+      this.name = nextName;
+      return this;
+    },
+    end(this: FakeRootSpan) {
+      this.ended = true;
+    },
+    isRecording(this: FakeRootSpan) {
+      return !this.ended;
+    },
+    recordException() {},
+    addEvent() {
+      return this;
+    },
+    addLink() {
+      return this;
+    },
+  } as unknown as Span & { attributes: Record<string, unknown>; ended: boolean; name: string };
+}
+
+function parseMetadata(span: { attributes: Record<string, unknown> }): Record<string, unknown> {
+  const raw = span.attributes.metadata;
+  return typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : {};
 }
 
 describe('isSafeAttachmentName', () => {
@@ -236,6 +319,89 @@ describe('routeAgentMessage return-path', () => {
     expect(s1Rows[0].platform_id).toBe(B);
     expect(JSON.parse(s1Rows[0].content).text).toBe('pong');
     expect(s2Rows).toHaveLength(0);
+  });
+
+  it('relays worker replies to the origin chat instead of waking the frontdesk again', async () => {
+    createMessagingGroup({
+      id: 'mg-cli',
+      channel_type: 'cli',
+      platform_id: 'local',
+      name: 'Local CLI',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+
+    const userFacingFrontdesk: Session = {
+      id: 'sess-A-cli',
+      agent_group_id: A,
+      messaging_group_id: 'mg-cli',
+      thread_id: null,
+      owner_user_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-01-10T00:00:00.000Z',
+    };
+    createSession(userFacingFrontdesk);
+    initSessionFolder(A, userFacingFrontdesk.id);
+    writeSessionMessage(A, userFacingFrontdesk.id, {
+      id: 'cli-question',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'local',
+      channelType: 'cli',
+      threadId: null,
+      content: JSON.stringify({ text: '库存状态如何查询', senderId: 'cli:local' }),
+    });
+
+    await routeAgentMessage(
+      {
+        id: 'frontdesk-delegates-to-worker',
+        platform_id: B,
+        content: JSON.stringify({ text: '请用一句话回复：库存状态如何查询' }),
+        in_reply_to: 'cli-question',
+        origin_user_id: 'cli:local',
+      },
+      userFacingFrontdesk,
+    );
+
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(SB.id, rootSpan);
+
+    const workerRows = readInbound(B, SB.id);
+    const workerInboundId = workerRows[0].id;
+
+    await routeAgentMessage(
+      {
+        id: 'worker-final-answer',
+        platform_id: A,
+        content: JSON.stringify({ text: '库存状态可在 ERP 库存管理模块实时查询。' }),
+        in_reply_to: workerInboundId,
+        origin_user_id: 'cli:local',
+      },
+      SB,
+    );
+
+    const frontdeskRows = readInbound(A, userFacingFrontdesk.id);
+    const frontdeskOutbound = readOutbound(A, userFacingFrontdesk.id);
+
+    expect(frontdeskRows).toHaveLength(1);
+    expect(frontdeskRows[0].id).toBe('cli-question');
+    expect(frontdeskOutbound).toHaveLength(1);
+    expect(frontdeskOutbound[0].channel_type).toBe('cli');
+    expect(frontdeskOutbound[0].platform_id).toBe('local');
+    expect(JSON.parse(frontdeskOutbound[0].content).text).toBe('库存状态可在 ERP 库存管理模块实时查询。');
+    expect(getSessionRootSpan(SB.id)).toBeUndefined();
+    expect(rootSpan.ended).toBe(true);
+    expect(rootSpan.attributes['output.value']).toBe('库存状态可在 ERP 库存管理模块实时查询。');
+    expect(parseMetadata(rootSpan).turn_result).toBe('answered');
   });
 
   it('fallback: a2a with no in_reply_to falls through to newest-session lookup', async () => {
@@ -487,6 +653,71 @@ describe('routeAgentMessage return-path', () => {
     expect(cSharedRows).toHaveLength(0);
     expect(cRootRows).toHaveLength(1);
     expect(JSON.parse(cRootRows[0].content).text).toBe('B delegates to C');
+  });
+
+  it('ends source root as delegated and starts a separate worker root with traceparent', async () => {
+    writeGroupConfig('b', { a2aSessionMode: 'root-session' });
+
+    const frontdeskRoot = makeRootSpan('interaction.frontdesk');
+    const workerRoot = makeRootSpan('interaction.worker', {
+      traceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      spanId: '1111111111111111',
+      traceFlags: 1,
+      isRemote: false,
+    });
+    const startSpan = vi.fn().mockReturnValue(workerRoot);
+    const tracerSpy = vi.spyOn(tracerModule, 'getTracer').mockReturnValue({ startSpan } as unknown as ReturnType<typeof tracerModule.getTracer>);
+
+    applyBusinessTags(frontdeskRoot, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.FRONTDESK,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(S1.id, frontdeskRoot);
+
+    try {
+      await routeAgentMessage(
+        {
+          id: 'msg-transfer-root',
+          platform_id: B,
+          content: JSON.stringify({ text: 'delegate to worker' }),
+          in_reply_to: null,
+        },
+        S1,
+      );
+    } finally {
+      tracerSpy.mockRestore();
+    }
+
+    const bRootSession = getSessionsByAgentGroup(B).find((s) => s.root_session_id === S1.id && s.id !== SB.id);
+    expect(bRootSession).toBeDefined();
+    if (!bRootSession) return;
+
+    expect(getSessionRootSpan(S1.id)).toBeUndefined();
+    expect(frontdeskRoot.ended).toBe(true);
+    expect(frontdeskRoot.name).toBe('interaction.frontdesk');
+
+    const frontdeskMetadata = parseMetadata(frontdeskRoot);
+    expect(frontdeskMetadata.span_scope).toBe('business');
+    expect(frontdeskMetadata.route_label).toBe('frontdesk');
+    expect(frontdeskMetadata.turn_result).toBe('delegated');
+    expect(frontdeskMetadata.delegate_to).toBe(B);
+    expect(frontdeskMetadata.selected_agent).toBe(B);
+
+    expect(startSpan).toHaveBeenCalledTimes(1);
+    expect(getSessionRootSpan(bRootSession.id)).toBe(workerRoot);
+    expect(workerRoot.name).toBe('interaction.worker');
+
+    const metadata = parseMetadata(workerRoot);
+    expect(metadata.span_scope).toBe('business');
+    expect(metadata.route_label).toBe('worker');
+    expect(metadata.engage_mode).toBe('a2a');
+    expect(metadata.selected_agent).toBe(B);
+    expect(workerRoot.attributes['input.value']).toBe('delegate to worker');
+
+    const bRows = readInbound(B, bRootSession.id);
+    expect(bRows).toHaveLength(1);
+    expect(bRows[0].traceparent).toBe('00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-01');
   });
 
   it('stale origin fallback: closed origin session falls through to newest active', async () => {

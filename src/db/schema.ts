@@ -195,7 +195,11 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- than falling back to agent-asserted identity. NULL on channel-side
   -- inbound (senderId embedded in content is authoritative) and on
   -- pre-migration rows.
-  origin_user_id TEXT
+  origin_user_id TEXT,
+  -- Optional W3C traceparent propagated across agent-to-agent hops so the
+  -- target session can continue the same business trace. NULL on channel-side
+  -- inbound and on rows written before this column existed.
+  traceparent    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
 

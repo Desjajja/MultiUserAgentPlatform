@@ -1,8 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { propagation, ROOT_CONTEXT, trace } from '@opentelemetry/api';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import { NodeTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
+import { startAgentTurn } from '../observability/turn-span.js';
 import { setRequestIdentity, clearRequestIdentity } from '../request-context.js';
 import { classifyIntent, confidenceAdvisory } from './classify-intent.js';
+
+class CapturingExporter {
+  readonly spans: Array<{ name: string; attributes: Record<string, unknown> }> = [];
+
+  export(
+    spans: ReadonlyArray<{ name: string; attributes?: Record<string, unknown> }>,
+    cb: (r: { code: number }) => void,
+  ): void {
+    for (const span of spans) {
+      this.spans.push({ name: span.name, attributes: { ...(span.attributes ?? {}) } });
+    }
+    cb({ code: 0 });
+  }
+
+  async shutdown(): Promise<void> {}
+  async forceFlush(): Promise<void> {}
+}
 
 function seedWorkers(names: string[]): void {
   const stmt = getInboundDb().prepare(
@@ -129,6 +150,52 @@ describe('classifyIntent tool handler', () => {
     // should be advised to clarify on confidence alone — not trip the
     // "multiple plausible workers" branch.
     expect(text.toLowerCase()).toContain('ask_user_question');
+  });
+
+  it('emits a TOOL span with official fields', async () => {
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+    trace.disable();
+    const exporter = new CapturingExporter();
+    const provider = new NodeTracerProvider();
+    provider.addSpanProcessor(new SimpleSpanProcessor(exporter as never));
+    provider.register();
+
+    const turn = startAgentTurn({
+      sessionId: 'sess-classify-span',
+      agentGroupId: 'ag-frontdesk',
+      provider: 'mock',
+      routeType: 'frontdesk',
+      parentContext: propagation.extract(ROOT_CONTEXT, {
+        traceparent: '00-0123456789abcdef0123456789abcdef-aaaaaaaaaaaaaaaa-01',
+      }),
+    });
+
+    await turn.run(async () => {
+      await classifyIntent.handler({
+        userMessage: 'please approve INV-001',
+        recommendedWorker: 'finance-worker',
+        confidence: 0.9,
+        candidates: ['finance-worker'],
+        reasoning: 'mentions approve + invoice',
+        action: 'delegate',
+      });
+    });
+    turn.complete();
+
+    const span = exporter.spans.find((entry) => entry.name === 'mcp.classify');
+    expect(span).toBeDefined();
+    expect(span!.attributes['openinference.span.kind']).toBe('TOOL');
+    expect(span!.attributes['tool.name']).toBe('classify_intent');
+    expect(JSON.parse(String(span!.attributes['tool.parameters']))).toMatchObject({
+      recommendedWorker: 'finance-worker',
+      confidence: 0.9,
+      action: 'delegate',
+    });
+    const metadata = JSON.parse(String(span!.attributes.metadata)) as Record<string, unknown>;
+    expect(metadata.span_scope).toBe('tool');
+    expect(metadata.tool_group).toBe('mcp');
+
+    trace.disable();
   });
 });
 

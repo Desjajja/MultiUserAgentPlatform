@@ -113,11 +113,11 @@ describe('observability bootstrap artifacts', () => {
 
   it('pins sim and prod compose images and avoids latest tags', () => {
     const simCompose = readUtf8(SIM_COMPOSE_PATH);
-    expect(simCompose).toMatch(/image:\s*arizephoenix\/phoenix:version-8\.0\.0/);
+    expect(simCompose).toMatch(/image:\s*arizephoenix\/phoenix:version-17\.2\.0/);
     expect(simCompose).not.toMatch(/:latest\b/);
 
     const prodCompose = readUtf8(PROD_COMPOSE_PATH);
-    expect(prodCompose).toMatch(/image:\s*arizephoenix\/phoenix:version-8\.0\.0/);
+    expect(prodCompose).toMatch(/image:\s*arizephoenix\/phoenix:version-17\.2\.0/);
     expect(prodCompose).toMatch(/image:\s*postgres:16/);
     expect(prodCompose).toMatch(/image:\s*grafana\/grafana:11\.0\.0/);
     expect(prodCompose).not.toMatch(/:latest\b/);

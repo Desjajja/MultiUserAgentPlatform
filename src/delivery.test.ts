@@ -11,12 +11,19 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { Span, SpanContext } from '@opentelemetry/api';
 
 vi.mock('./container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
   isContainerRunning: vi.fn().mockReturnValue(false),
   killContainer: vi.fn(),
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
+}));
+
+const routeAgentMessageMock = vi.fn().mockResolvedValue(undefined);
+
+vi.mock('./modules/agent-to-agent/agent-route.js', () => ({
+  routeAgentMessage: routeAgentMessageMock,
 }));
 
 vi.mock('./config.js', async () => {
@@ -30,8 +37,16 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGr
 import { resolveSession, outboundDbPath } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
 import { maybeStartProgressStatus } from './modules/progress-status/index.js';
-import { consumeSessionSpanContext, storeSessionSpanContext } from './observability/context-bridge.js';
-import type { SpanContext } from '@opentelemetry/api';
+import { BusinessTagKeys, RouteLabel, SpanScope, applyBusinessTags } from './observability/business-tags.js';
+import {
+  consumeSessionSpanContext,
+  getSessionRootSpan,
+  storeSessionRootSpan,
+  storeSessionSpanContext,
+} from './observability/context-bridge.js';
+
+await import('./modules/classification-log/index.js');
+await import('./modules/erp-audit/index.js');
 
 function now(): string {
   return new Date().toISOString();
@@ -90,11 +105,97 @@ function insertOutbound(
   db.close();
 }
 
+function insertOutboundRaw(
+  agentGroupId: string,
+  sessionId: string,
+  row: {
+    id: string;
+    kind: string;
+    content: string;
+    channelType?: string | null;
+    platformId?: string | null;
+    threadId?: string | null;
+  },
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), ?, ?, ?, ?, ?)`,
+  ).run(
+    row.id,
+    row.kind,
+    row.platformId ?? null,
+    row.channelType ?? null,
+    row.threadId ?? null,
+    row.content,
+  );
+  db.close();
+}
+
+function makeRootSpan(name = 'interaction.worker'): Span & {
+  attributes: Record<string, unknown>;
+  ended: boolean;
+  name: string;
+} {
+  type FakeRootSpan = Span & {
+    attributes: Record<string, unknown>;
+    ended: boolean;
+    name: string;
+  };
+  const spanContext: SpanContext = {
+    traceId: '11111111111111111111111111111111',
+    spanId: '2222222222222222',
+    traceFlags: 1,
+    isRemote: false,
+  };
+
+  return {
+    name,
+    attributes: {},
+    ended: false,
+    spanContext: () => spanContext,
+    setAttribute(this: FakeRootSpan, key: string, value: unknown) {
+      this.attributes[key] = value;
+      return this;
+    },
+    setAttributes(this: FakeRootSpan, attrs: Record<string, unknown>) {
+      Object.assign(this.attributes, attrs);
+      return this;
+    },
+    setStatus() {
+      return this;
+    },
+    updateName(this: FakeRootSpan, nextName: string) {
+      this.name = nextName;
+      return this;
+    },
+    end(this: FakeRootSpan) {
+      this.ended = true;
+    },
+    isRecording(this: FakeRootSpan) {
+      return !this.ended;
+    },
+    recordException() {},
+    addEvent() {
+      return this;
+    },
+    addLink() {
+      return this;
+    },
+  } as unknown as Span & { attributes: Record<string, unknown>; ended: boolean; name: string };
+}
+
+function parseMetadata(span: { attributes: Record<string, unknown> }): Record<string, unknown> {
+  const raw = span.attributes.metadata;
+  return typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : {};
+}
+
 beforeEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   const db = initTestDb();
   runMigrations(db);
+  routeAgentMessageMock.mockClear();
 });
 
 afterEach(() => {
@@ -241,5 +342,165 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         emoji: 'THINKING',
       }),
     ]);
+  });
+
+  it('system messages do not end interaction root', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(session.id, rootSpan);
+
+    insertOutboundRaw('ag-1', session.id, {
+      id: 'out-system-classify',
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'classify_intent',
+        classificationId: 'cls-1',
+        userMessage: 'route this',
+        recommendedWorker: 'ops-worker',
+        confidence: 0.77,
+        candidates: ['ops-worker'],
+        reasoning: 'worker request',
+        action_taken: 'delegate',
+      }),
+    });
+    insertOutboundRaw('ag-1', session.id, {
+      id: 'out-system-erp',
+      kind: 'system',
+      content: JSON.stringify({ action: 'erp_audit', path: '/execute', requesterSource: 'session', status: 'ok' }),
+    });
+    insertOutboundRaw('ag-1', session.id, {
+      id: 'out-usage',
+      kind: 'llm-usage',
+      content: JSON.stringify({ model: 'gpt-test', totalTokens: 12 }),
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(getSessionRootSpan(session.id)).toBe(rootSpan);
+    expect(rootSpan.ended).toBe(false);
+  });
+
+  it('agent delivery keeps the source root live when a downstream answer is expected', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(session.id, rootSpan);
+
+    insertOutboundRaw('ag-1', session.id, {
+      id: 'out-agent-live',
+      kind: 'chat',
+      channelType: 'agent',
+      platformId: 'ag-peer',
+      content: JSON.stringify({ text: 'delegate this turn' }),
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(routeAgentMessageMock).toHaveBeenCalledTimes(1);
+    expect(getSessionRootSpan(session.id)).toBe(rootSpan);
+    expect(rootSpan.ended).toBe(false);
+  });
+
+  it('delegation-only fallback ends as delegated without output.value', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(session.id, rootSpan);
+
+    insertOutboundRaw('ag-1', session.id, {
+      id: 'out-agent-delegated',
+      kind: 'chat',
+      channelType: 'agent',
+      platformId: 'ag-peer',
+      content: JSON.stringify({ text: 'fire and forget', _downstreamAnswerExpected: false }),
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(routeAgentMessageMock).toHaveBeenCalledTimes(1);
+    expect(getSessionRootSpan(session.id)).toBeUndefined();
+    expect(rootSpan.ended).toBe(true);
+    expect(rootSpan.attributes['output.value']).toBeUndefined();
+    const metadata = parseMetadata(rootSpan);
+    expect(metadata.turn_result).toBe('delegated');
+    expect(metadata.delegate_to).toBe('ag-peer');
+  });
+
+  it('user-visible replies still end the root and set output.value', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(session.id, rootSpan);
+
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-msg-id';
+      },
+    });
+    insertOutbound('ag-1', session.id, 'out-user-visible');
+
+    await deliverSessionMessages(session);
+
+    expect(getSessionRootSpan(session.id)).toBeUndefined();
+    expect(rootSpan.ended).toBe(true);
+    expect(rootSpan.attributes['output.value']).toBe('hello');
+    const metadata = parseMetadata(rootSpan);
+    expect(metadata.turn_result).toBe('answered');
+  });
+
+  it('permanently failed user-visible delivery ends the root as failed', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const rootSpan = makeRootSpan('interaction.worker');
+    applyBusinessTags(rootSpan, {
+      [BusinessTagKeys.SPAN_SCOPE]: SpanScope.BUSINESS,
+      [BusinessTagKeys.ROUTE_LABEL]: RouteLabel.WORKER,
+      [BusinessTagKeys.ENTRYPOINT]: 'chat',
+    });
+    storeSessionRootSpan(session.id, rootSpan);
+
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('simulated channel failure');
+      },
+    });
+    insertOutbound('ag-1', session.id, 'out-user-visible-fail');
+
+    await deliverSessionMessages(session);
+    expect(getSessionRootSpan(session.id)).toBe(rootSpan);
+    expect(rootSpan.ended).toBe(false);
+
+    await deliverSessionMessages(session);
+    expect(getSessionRootSpan(session.id)).toBe(rootSpan);
+    expect(rootSpan.ended).toBe(false);
+
+    await deliverSessionMessages(session);
+
+    expect(getSessionRootSpan(session.id)).toBeUndefined();
+    expect(rootSpan.ended).toBe(true);
+    expect(rootSpan.attributes['output.value']).toBeUndefined();
+    const metadata = parseMetadata(rootSpan);
+    expect(metadata.turn_result).toBe('failed');
   });
 });

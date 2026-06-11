@@ -57,49 +57,49 @@ export async function runCoverageFixture(): Promise<void> {
   );
 
   await withSpan(
-    'delivery.session.drain',
+    'platform.delivery.drain',
     chainAttrs({ 'session.id': 'sess-1', 'message.count': 1 }),
     async () => {},
   );
 
   await withSpan(
-    'delivery.message.deliver',
+    'platform.delivery.message',
     ${deliveryAttrs},
     async () => {},
   );
 
   await withSpan(
-    'delivery.channel.send',
-    chainAttrs({ 'channel.type': 'cli', ...outputAttrs('hello world') }),
-    async () => {},
-  );
-
-  await withSpan(
-    'container.wake',
-    chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1' }),
-    async () => {},
-  );
-
-  await withSpan(
-    'container.spawn',
-    chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1', provider: 'mock' }),
-    async () => {},
-  );
-
-  await withSpan(
-    'container.kill',
-    chainAttrs({ 'session.id': 'sess-1', reason: 'fixture' }),
-    async () => {},
-  );
-
-  await withSpan(
-    'channel.cli.receive',
+    'platform.delivery.send',
     chainAttrs({ 'channel.type': 'cli' }),
     async () => {},
   );
 
   await withSpan(
-    'channel.feishu.receive',
+    'platform.container.wake',
+    chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1' }),
+    async () => {},
+  );
+
+  await withSpan(
+    'platform.container.spawn',
+    chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1', provider: 'mock' }),
+    async () => {},
+  );
+
+  await withSpan(
+    'platform.container.kill',
+    chainAttrs({ 'session.id': 'sess-1', reason: 'fixture' }),
+    async () => {},
+  );
+
+  await withSpan(
+    'platform.channel.receive',
+    chainAttrs({ 'channel.type': 'cli' }),
+    async () => {},
+  );
+
+  await withSpan(
+    'platform.channel.receive',
     chainAttrs({ 'channel.type': 'feishu', 'message.kind': 'chat' }),
     async () => {},
   );
@@ -136,7 +136,7 @@ describe('observability coverage gate', () => {
     const validation = validateObservabilityCoverage(report);
 
     expect(report.namespaces).toHaveLength(20);
-    expect(report.migrations).toHaveLength(11);
+    expect(report.migrations).toHaveLength(9);
     expect(report.moduleSlugs).toHaveLength(13);
     expect(validation.forwardViolations).toHaveLength(0);
     expect(validation.backwardViolations).toHaveLength(0);
@@ -154,7 +154,7 @@ export async function runCoverageFixture(): Promise<void> {
   const spanAttrs = chainAttrs({ 'session.id': 'sess-1', 'message.count': 1 });
 
   await withSpan(
-    'delivery.session.drain',
+    'platform.delivery.drain',
     spanAttrs,
     async () => {},
   );
@@ -172,43 +172,43 @@ export async function runCoverageFixture(): Promise<void> {
   );
 
   await withSpan(
-    'delivery.message.deliver',
+    'platform.delivery.message',
     chainAttrs({ 'msg.id': 'm-1', 'message.kind': 'chat' }),
     async () => {},
   );
 
   await withSpan(
-    'delivery.channel.send',
+    'platform.delivery.send',
     chainAttrs({ 'channel.type': 'cli', 'output.value': 'hello', 'output.mime_type': 'text/plain' }),
     async () => {},
   );
 
   await withSpan(
-    'container.wake',
+    'platform.container.wake',
     chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1' }),
     async () => {},
   );
 
   await withSpan(
-    'container.spawn',
+    'platform.container.spawn',
     chainAttrs({ 'session.id': 'sess-1', 'agent.group.id': 'agent-1', provider: 'mock' }),
     async () => {},
   );
 
   await withSpan(
-    'container.kill',
+    'platform.container.kill',
     chainAttrs({ 'session.id': 'sess-1', reason: 'fixture' }),
     async () => {},
   );
 
   await withSpan(
-    'channel.cli.receive',
+    'platform.channel.receive',
     chainAttrs({ 'channel.type': 'cli' }),
     async () => {},
   );
 
   await withSpan(
-    'channel.feishu.receive',
+    'platform.channel.receive',
     chainAttrs({ 'channel.type': 'feishu', 'message.kind': 'chat' }),
     async () => {},
   );
@@ -245,22 +245,25 @@ export async function runCoverageFixture(): Promise<void> {
 
     const validation = validateObservabilityCoverage(collectObservabilityCoverage({ repoRoot }));
 
-    expect(validation.kindViolations.map((violation) => violation.name)).toContain('delivery.message.deliver');
-    expect(formatCoverageGateFailure(validation)).toContain('Kind violations (1): delivery.message.deliver');
+    expect(validation.kindViolations.map((violation) => violation.name)).toContain('platform.delivery.message');
+    expect(formatCoverageGateFailure(validation)).toContain('Kind violations (1): platform.delivery.message');
   });
 
   it('fails backward validation when a keep/rename target is missing', () => {
     const repoRoot = makeFixtureRepo({
-      baselineSource: buildBaselineSource().replace(
-        /\s*await withSpan\(\s*'channel\.feishu\.receive'[\s\S]*?async \(\) => \{\},\s*\);\n/m,
-        '\n',
-      ),
+      baselineSource: buildBaselineSource(
+        `await withSpan('platform.channel.receive', chainAttrs({ 'channel.type': 'feishu' }), async () => {});\n`,
+      )
+        .split("'platform.channel.receive'")
+        .join("'PLATFORM_CHANNEL_RECEIVE_PLACEHOLDER'")
+        .split("'PLATFORM_CHANNEL_RECEIVE_PLACEHOLDER'")
+        .join("''"),
     });
 
     const validation = validateObservabilityCoverage(collectObservabilityCoverage({ repoRoot }));
 
-    expect(validation.backwardViolations.map((violation) => violation.requiredTarget)).toContain('channel.feishu.receive');
-    expect(formatCoverageGateFailure(validation)).toContain('channel.feishu.receive');
+    expect(validation.backwardViolations.map((violation) => violation.requiredTarget)).toContain('platform.channel.receive');
+    expect(formatCoverageGateFailure(validation)).toContain('platform.channel.receive');
   });
 
   it('fails backward validation when a deleted span still exists', () => {
@@ -329,9 +332,9 @@ export async function ignoredFixture(): Promise<void> {
     const validation = validateObservabilityCoverage(report);
 
     expect(report.namespaces).toHaveLength(20);
-    expect(report.migrations).toHaveLength(11);
+    expect(report.migrations).toHaveLength(9);
     expect(report.moduleSlugs).toHaveLength(13);
-    expect(report.hostSpanOccurrences.length).toBeGreaterThanOrEqual(10);
+    expect(report.hostSpanOccurrences.length).toBeGreaterThanOrEqual(9);
     expect(report.runnerSpanOccurrences).toHaveLength(0);
     expect(validation.forwardViolations).toHaveLength(0);
     expect(validation.backwardViolations).toHaveLength(0);

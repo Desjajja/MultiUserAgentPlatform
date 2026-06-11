@@ -12,7 +12,7 @@ services:
       - ./init/grafana_readonly.sql:/docker-entrypoint-initdb.d/10-grafana_readonly.sql:ro
 
   phoenix:
-    image: arizephoenix/phoenix:version-8.0.0
+    image: arizephoenix/phoenix:version-17.2.0
     depends_on:
       - postgres
     ports:
@@ -23,6 +23,10 @@ services:
       PHOENIX_SQL_DATABASE_URL: postgresql://${PHOENIX_POSTGRES_USER:-phoenix}:${PHOENIX_POSTGRES_PASSWORD:-phoenix_local_only}@postgres:5432/${PHOENIX_POSTGRES_DB:-phoenix}
       PHOENIX_ENABLE_PROMETHEUS: "true"
       PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "7"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOWED_PROVIDERS: "NONE"
+      PHOENIX_AGENTS_DISABLE_WEB_ACCESS: "true"
 
   litellm:
     image: ghcr.io/berriai/litellm:main-v1.72.5.dev1

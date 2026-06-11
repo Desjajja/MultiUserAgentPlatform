@@ -1,26 +1,66 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
-import { getPendingMessages, markCompleted } from './db/messages-in.js';
+import { clearRequestIdentity, setRequestIdentity } from './request-context.js';
+import { getPendingMessages, markCompleted, markProcessing } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { processQuery, selectTurnTraceparent, dispatchResultText } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
   initTestSessionDb();
+  try {
+    getInboundDb().prepare('ALTER TABLE messages_in ADD COLUMN traceparent TEXT').run();
+  } catch {
+    // Already present in newer test schemas.
+  }
 });
 
 afterEach(() => {
+  clearRequestIdentity();
   closeSessionDb();
 });
 
-function insertMessage(id: string, kind: string, content: object, opts?: { processAfter?: string; trigger?: 0 | 1 }) {
+function insertMessage(
+  id: string,
+  kind: string,
+  content: object,
+  opts?: {
+    processAfter?: string;
+    trigger?: 0 | 1;
+    platformId?: string | null;
+    channelType?: string | null;
+    threadId?: string | null;
+    traceparent?: string | null;
+  },
+) {
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, content)
-     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, traceparent, content)
+     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, JSON.stringify(content));
+    .run(
+      id,
+      kind,
+      opts?.processAfter ?? null,
+      opts?.trigger ?? 1,
+      opts?.platformId ?? null,
+      opts?.channelType ?? null,
+      opts?.threadId ?? null,
+      opts?.traceparent ?? null,
+      JSON.stringify(content),
+    );
+}
+
+function sessionIdentity() {
+  return {
+    userId: 'feishu:ou_alice',
+    channelType: 'feishu',
+    platformId: 'feishu:p2p:ou_alice',
+    threadId: null,
+    source: 'session' as const,
+  };
 }
 
 describe('formatter', () => {
@@ -264,6 +304,204 @@ describe('mock provider', () => {
   });
 });
 
+describe('traceparent turn selection', () => {
+  it('uses the newest trigger row traceparent for the active turn parent', () => {
+    const messages = [
+      {
+        id: 'older-trigger',
+        seq: 1,
+        kind: 'chat',
+        timestamp: '2026-06-09T00:00:00Z',
+        status: 'pending',
+        process_after: null,
+        recurrence: null,
+        tries: 0,
+        trigger: 1 as const,
+        platform_id: 'feishu:p2p:ou_alice',
+        channel_type: 'feishu',
+        thread_id: null,
+        content: JSON.stringify({ senderId: 'feishu:ou_alice', text: 'older' }),
+        origin_user_id: null,
+        traceparent: '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-01',
+      },
+      {
+        id: 'context-only',
+        seq: 2,
+        kind: 'chat',
+        timestamp: '2026-06-09T00:00:01Z',
+        status: 'pending',
+        process_after: null,
+        recurrence: null,
+        tries: 0,
+        trigger: 0 as const,
+        platform_id: 'feishu:p2p:ou_alice',
+        channel_type: 'feishu',
+        thread_id: null,
+        content: JSON.stringify({ senderId: 'feishu:ou_alice', text: 'context' }),
+        origin_user_id: null,
+        traceparent: '00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2222222222222222-01',
+      },
+      {
+        id: 'newest-trigger',
+        seq: 3,
+        kind: 'chat',
+        timestamp: '2026-06-09T00:00:02Z',
+        status: 'pending',
+        process_after: null,
+        recurrence: null,
+        tries: 0,
+        trigger: 1 as const,
+        platform_id: 'feishu:p2p:ou_alice',
+        channel_type: 'feishu',
+        thread_id: null,
+        content: JSON.stringify({ senderId: 'feishu:ou_alice', text: 'newest' }),
+        origin_user_id: null,
+        traceparent: '00-cccccccccccccccccccccccccccccccc-3333333333333333-01',
+      },
+    ];
+
+    expect(selectTurnTraceparent(messages)).toBe('00-cccccccccccccccccccccccccccccccc-3333333333333333-01');
+  });
+});
+
+describe('result message routing', () => {
+  function seedChannelDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  function seedAgentDestination(name: string, agentGroupId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'agent', NULL, NULL, ?)`,
+      )
+      .run(name, name, agentGroupId);
+  }
+
+  it('dispatches message blocks with extra attributes to the requested destination', async () => {
+    seedChannelDestination('local-cli', 'cli', 'local');
+    seedAgentDestination('access-worker', 'ag-access-worker');
+    insertMessage(
+      'm1',
+      'chat',
+      { senderId: 'cli:local', sender: 'cli', text: '请把这个问题转给合适的 worker' },
+      { platformId: 'local', channelType: 'cli' },
+    );
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    markProcessing(['m1']);
+
+    const query = {
+      push() {},
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'init' as const, continuation: 'extra-message-attrs-test' };
+          yield {
+            type: 'result' as const,
+            text: '<message to="access-worker" from="local-cli" context="接到用户请求：库存状态如何查询">用户询问：库存状态如何查询。请用一句话回复。</message>',
+          };
+        },
+      },
+    };
+
+    await processQuery(query, routing, ['m1'], 'mock');
+
+    const [outbound] = getUndeliveredMessages();
+    expect(outbound.channel_type).toBe('agent');
+    expect(outbound.platform_id).toBe('ag-access-worker');
+    expect(JSON.parse(outbound.content).text).toBe('用户询问：库存状态如何查询。请用一句话回复。');
+    expect(JSON.parse(outbound.content).text).not.toContain('<message');
+  });
+});
+
+describe('follow-up traceparent guard', () => {
+  it('ends the active query and releases rows when a follow-up carries a new traceparent', async () => {
+    setRequestIdentity(sessionIdentity());
+    insertMessage(
+      'm1',
+      'chat',
+      { senderId: 'feishu:ou_alice', sender: 'Alice', text: 'first turn' },
+      {
+        trigger: 1,
+        platformId: 'feishu:p2p:ou_alice',
+        channelType: 'feishu',
+        threadId: null,
+        traceparent: '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-01',
+      },
+    );
+    const initialMessages = getPendingMessages();
+    const routing = extractRouting(initialMessages);
+    markProcessing(['m1']);
+
+    let endCalls = 0;
+    let waiting: (() => void) | null = null;
+    const pushed: string[] = [];
+    let ended = false;
+    const query = {
+      push(message: string) {
+        pushed.push(message);
+      },
+      end() {
+        endCalls += 1;
+        ended = true;
+        waiting?.();
+      },
+      abort() {
+        ended = true;
+        waiting?.();
+      },
+      events: {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'init' as const, continuation: 'followup-traceparent-test' };
+          while (!ended) {
+            await new Promise<void>((resolve) => {
+              waiting = resolve;
+            });
+            waiting = null;
+          }
+        },
+      },
+    };
+
+    const processPromise = processQuery(query, routing, ['m1'], 'mock', {
+      activeTurnTraceparent: '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1111111111111111-01',
+    });
+
+    await Bun.sleep(50);
+    insertMessage(
+      'm2',
+      'chat',
+      { senderId: 'feishu:ou_alice', sender: 'Alice', text: 'delegated follow-up' },
+      {
+        trigger: 1,
+        platformId: 'feishu:p2p:ou_alice',
+        channelType: 'feishu',
+        threadId: null,
+        traceparent: '00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-2222222222222222-01',
+      },
+    );
+
+    await Promise.race([
+      processPromise,
+      Bun.sleep(2000).then(() => {
+        throw new Error('timed out waiting for processQuery to end');
+      }),
+    ]);
+
+    expect(endCalls).toBe(1);
+    expect(pushed).toHaveLength(0);
+    expect(getPendingMessages().map((message) => message.id)).toContain('m2');
+  });
+});
+
 describe('end-to-end with mock provider', () => {
   it('should read messages_in, process with mock provider, write messages_out', async () => {
     // Insert a chat message into inbound DB
@@ -316,5 +554,23 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+describe('dispatchResultText', () => {
+  it('delivers bare text via routing-context fallback when destinations map is empty', () => {
+    dispatchResultText('Hello from sdk-openai', {
+      channelType: 'cli',
+      platformId: 'local',
+      threadId: null,
+      inReplyTo: 'm-cli-1',
+    });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0]!.channel_type).toBe('cli');
+    expect(out[0]!.platform_id).toBe('local');
+    expect(out[0]!.in_reply_to).toBe('m-cli-1');
+    expect(JSON.parse(out[0]!.content).text).toBe('Hello from sdk-openai');
   });
 });

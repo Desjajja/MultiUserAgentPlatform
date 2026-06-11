@@ -5,8 +5,11 @@ import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 import { type Context, context, propagation, ROOT_CONTEXT, trace } from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 
+import { getOutboundDb } from '../db/connection.js';
+
 let initialized = false;
 let parentContext: Context = ROOT_CONTEXT;
+const ACTIVE_TURN_TRACEPARENT_KEY = 'traceparent:active-turn';
 
 export function initContainerOTel(sessionId: string): void {
   if (initialized) return;
@@ -29,14 +32,74 @@ export function initContainerOTel(sessionId: string): void {
 
   const traceparent = process.env.OTEL_TRACEPARENT;
   if (traceparent) {
-    parentContext = propagation.extract(ROOT_CONTEXT, { traceparent });
+    parentContext = propagation.extract(context.active(), { traceparent });
   }
 }
 
 export function injectTraceparent(headers: Record<string, string>): Record<string, string> {
   const carrier: Record<string, string> = { ...headers };
-  propagation.inject(parentContext, carrier);
+  propagation.inject(context.active(), carrier);
+  if (!carrier.traceparent) {
+    propagation.inject(parentContext, carrier);
+  }
   return carrier;
+}
+
+export function contextFromTraceparent(traceparent?: string | null): Context {
+  if (!traceparent) return parentContext;
+  return propagation.extract(context.active(), { traceparent });
+}
+
+export function activeContextTraceparent(ctx: Context = context.active()): string | null {
+  const carrier: Record<string, string> = {};
+  propagation.inject(ctx, carrier);
+  return carrier.traceparent ?? null;
+}
+
+export function storeActiveTurnTraceparent(ctx: Context = context.active()): void {
+  const traceparent = activeContextTraceparent(ctx);
+  if (!traceparent) return;
+  try {
+    getOutboundDb()
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(ACTIVE_TURN_TRACEPARENT_KEY, traceparent, new Date().toISOString());
+  } catch {
+    // Best-effort bridge for the MCP child process. Runtime tracing should
+    // still proceed even if the shared state DB is unavailable.
+  }
+}
+
+export function readActiveTurnTraceparent(): string | null {
+  try {
+    const row = getOutboundDb()
+      .prepare('SELECT value FROM session_state WHERE key = ?')
+      .get(ACTIVE_TURN_TRACEPARENT_KEY) as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearActiveTurnTraceparent(): void {
+  try {
+    getOutboundDb().prepare('DELETE FROM session_state WHERE key = ?').run(ACTIVE_TURN_TRACEPARENT_KEY);
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+/**
+ * Return the OTel context derived from `OTEL_TRACEPARENT` (set once by
+ * `initContainerOTel`), or `ROOT_CONTEXT` if no traceparent was injected.
+ *
+ * Pass this as the third argument to `tracer.startSpan(name, opts, ctx)`
+ * so container spans (notably `platform.agent.turn`) parent under the host trace
+ * instead of becoming orphans. Without this, the host→container trace
+ * tree breaks because the container process starts with `ROOT_CONTEXT`
+ * as its active OTel context.
+ */
+export function getParentContext(): Context {
+  return parentContext;
 }
 
 export function getTracer() {

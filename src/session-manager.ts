@@ -276,6 +276,7 @@ export function writeSessionMessage(
      * NULL on channel-side inbound (senderId already embedded in content).
      */
     originUserId?: string | null;
+    traceparent?: string | null;
   },
 ): void {
   // Extract base64 attachment data, save to inbox, replace with file paths
@@ -296,6 +297,7 @@ export function writeSessionMessage(
       trigger: message.trigger ?? 1,
       sourceSessionId: message.sourceSessionId ?? null,
       originUserId: message.originUserId ?? null,
+      traceparent: message.traceparent ?? null,
     });
   } finally {
     db.close();

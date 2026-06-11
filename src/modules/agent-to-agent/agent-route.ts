@@ -24,11 +24,19 @@ import path from 'path';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { readContainerConfig, type A2aSessionMode } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
-import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { BusinessTagKeys, deriveRouteLabel } from '../../observability/business-tags.js';
+import {
+  clearSessionSpanContext,
+  endSessionRootSpan,
+  startSessionRootSpan,
+  updateSessionRootSpanTags,
+} from '../../observability/context-bridge.js';
+import { openInboundDb, resolveSession, sessionDir, writeOutboundDirect, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { hasDestination } from './db/agent-destinations.js';
 import { resolveOriginUserId } from './origin-user.js';
@@ -163,18 +171,25 @@ export interface RoutableAgentMessage {
  *    has been recorded with `source_session_id` (e.g. fresh installs,
  *    pre-migration data).
  */
-function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session, targetAgentGroupId: string): Session {
+function resolveTargetSession(
+  msg: RoutableAgentMessage,
+  sourceSession: Session,
+  targetAgentGroupId: string,
+): { session: Session; directReturnPath: boolean } {
   const srcDb = openInboundDb(sourceSession.agent_group_id, sourceSession.id);
   let originSessionId: string | null = null;
+  let directReturnPath = false;
   try {
     if (msg.in_reply_to) {
       originSessionId = getInboundSourceSessionId(srcDb, msg.in_reply_to);
+      directReturnPath = !!originSessionId;
     }
     if (!originSessionId) {
       // Peer-affinity fallback — covers the case where the container's
       // outbound write didn't carry in_reply_to (e.g. legacy MCP send_message
       // path, container running pre-fix code).
       originSessionId = getMostRecentPeerSourceSessionId(srcDb, targetAgentGroupId);
+      directReturnPath = false;
     }
   } finally {
     srcDb.close();
@@ -182,7 +197,7 @@ function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session,
   if (originSessionId) {
     const candidate = getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
-      return candidate;
+      return { session: candidate, directReturnPath };
     }
   }
 
@@ -190,7 +205,8 @@ function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session,
   const targetConfig = getTargetA2aSessionMode(targetAgentGroupId);
   if (targetConfig === 'root-session') {
     const rootSessionId = sourceSession.root_session_id ?? sourceSession.id;
-    return resolveSession(
+    return {
+      session: resolveSession(
       targetAgentGroupId,
       null,
       null,
@@ -198,16 +214,62 @@ function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session,
       sourceSession.owner_user_id,
       rootSessionId,
       sourceDepth,
-    ).session;
+    ).session,
+      directReturnPath: false,
+    };
   }
 
-  return resolveSession(targetAgentGroupId, null, null, 'agent-shared', null, null, sourceDepth).session;
+  return {
+    session: resolveSession(targetAgentGroupId, null, null, 'agent-shared', null, null, sourceDepth).session,
+    directReturnPath: false,
+  };
+}
+
+function relayDirectReturnToOriginChat(
+  targetSession: Session,
+  msg: RoutableAgentMessage,
+  content: string,
+): boolean {
+  if (!targetSession.messaging_group_id) return false;
+  const messagingGroup = getMessagingGroup(targetSession.messaging_group_id);
+  if (!messagingGroup) return false;
+
+  return writeOutboundDirect(targetSession.agent_group_id, targetSession.id, {
+    id: `a2a-relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    platformId: messagingGroup.platform_id,
+    channelType: messagingGroup.channel_type,
+    threadId: targetSession.thread_id,
+    content,
+    inReplyTo: msg.in_reply_to,
+  });
+}
+
+function outputValueFromContent(content: string): string | undefined {
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+    if (text.length > 0) return text;
+    const markdown = typeof parsed.markdown === 'string' ? parsed.markdown.trim() : '';
+    return markdown.length > 0 ? markdown : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function getTargetA2aSessionMode(targetAgentGroupId: string): A2aSessionMode {
   const target = getAgentGroup(targetAgentGroupId);
   if (!target) return 'agent-shared';
   return readContainerConfig(target.folder).a2aSessionMode ?? 'agent-shared';
+}
+
+function expectsDownstreamAnswer(content: string): boolean {
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    return parsed._downstreamAnswerExpected !== false;
+  } catch {
+    return true;
+  }
 }
 
 export async function routeAgentMessage(msg: RoutableAgentMessage, session: Session): Promise<void> {
@@ -244,8 +306,9 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     }
   }
 
-  const targetSession = resolveTargetSession(msg, session, targetAgentGroupId);
+  const { session: targetSession, directReturnPath } = resolveTargetSession(msg, session, targetAgentGroupId);
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const downstreamAnswerExpected = expectsDownstreamAnswer(msg.content);
 
   // If the source message references files (via `send_file`), forward the
   // bytes from the source's outbox into the target's inbox so the target
@@ -276,6 +339,53 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   }
   if (!originUserId) originUserId = session.owner_user_id ?? null;
 
+  if (directReturnPath && relayDirectReturnToOriginChat(targetSession, msg, forwardedContent)) {
+    updateSessionRootSpanTags(session.id, {
+      [BusinessTagKeys.TURN_RESULT]: 'answered',
+    });
+    endSessionRootSpan(session.id, outputValueFromContent(forwardedContent));
+    clearSessionSpanContext(session.id);
+    log.info('Agent reply relayed to origin chat', {
+      from: session.agent_group_id,
+      to: targetAgentGroupId,
+      targetSession: targetSession.id,
+      originUserId,
+    });
+    return;
+  }
+
+  let traceparent: string | null = null;
+  if (downstreamAnswerExpected && targetAgentGroupId !== session.agent_group_id) {
+    const targetGroup = getAgentGroup(targetAgentGroupId);
+    if (targetGroup) {
+      const targetRouteLabel = deriveRouteLabel(targetGroup.folder);
+      updateSessionRootSpanTags(session.id, {
+        [BusinessTagKeys.TURN_RESULT]: 'delegated',
+        [BusinessTagKeys.DELEGATE_TO]: targetAgentGroupId,
+        [BusinessTagKeys.SELECTED_AGENT]: targetAgentGroupId,
+      });
+      traceparent =
+        startSessionRootSpan({
+          sessionId: targetSession.id,
+          routeLabel: targetRouteLabel,
+          inputValue: outputValueFromContent(forwardedContent) ?? forwardedContent,
+          userId: originUserId,
+          agentGroupId: targetAgentGroupId,
+          parentSessionId: session.id,
+          tags: {
+            [BusinessTagKeys.SPAN_SCOPE]: 'business',
+            [BusinessTagKeys.ROUTE_LABEL]: targetRouteLabel,
+            [BusinessTagKeys.ENTRYPOINT]: 'chat',
+            [BusinessTagKeys.INTENT]: 'chat',
+            [BusinessTagKeys.ENGAGE_MODE]: 'a2a',
+            [BusinessTagKeys.SELECTED_AGENT]: targetAgentGroupId,
+          },
+        }) ?? null;
+      endSessionRootSpan(session.id);
+      clearSessionSpanContext(session.id);
+    }
+  }
+
   writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
     kind: 'chat',
@@ -286,6 +396,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     content: forwardedContent,
     sourceSessionId: session.id,
     originUserId,
+    traceparent,
   });
   log.info('Agent message routed', {
     from: session.agent_group_id,
