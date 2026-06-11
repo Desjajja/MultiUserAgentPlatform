@@ -45,6 +45,9 @@ container/agent-runner/node_modules/
 *.db-wal
 *.pid
 
+# LiteLLM proxy config contains secrets — use config.example.yaml as template
+infra/litellm/config.yaml
+
 # Agent working state (advisory, not authoritative — see CLAUDE.md §Session Continuation Guide)
 .sisyphus/
 

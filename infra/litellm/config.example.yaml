@@ -1,14 +1,14 @@
-# LiteLLM Proxy Configuration
+# LiteLLM Proxy Configuration Template
 # See: docs/litellm-gateway.md, ADR-0016
 #
-# Frontdesk lane testing — unified deepseek-v4-flash via opencode-go endpoint.
+# Copy this file to config.yaml and replace placeholders with your actual values.
 
 model_list:
   - model_name: "deepseek-v4-flash"
     litellm_params:
       model: "openai/deepseek-v4-flash"
-      api_key: "sk-6SaUXK5nUKAOHUnpJb3UbuD8HTIRH173F1FBOEF0hGbHXAFQV1AsyE14QEdONuxZ"
-      api_base: "https://opencode.ai/zen/go/v1"
+      api_key: "sk-YOUR_API_KEY_HERE"
+      api_base: "https://your-api-base-url.com/v1"
 
 litellm_settings:
   # W3C traceparent propagation — allows container traceparent to flow through
