@@ -33,6 +33,8 @@ describe('generate-env-local-proposed', () => {
     expect(rendered).toMatch(/PHOENIX_COLLECTOR_ENDPOINT=http:\/\/localhost:6006\/v1\/traces/);
     expect(rendered).toMatch(/OTEL_SERVICE_NAME=frontlane-host/);
     expect(rendered).toMatch(/GRAFANA_HOST_PORT=3001/);
+    expect(rendered).toMatch(/dxy-dev branch already defaults to frontlane-lab-frontdesk/);
+    expect(rendered).toMatch(/main and unknown branches keep frontlane-template-frontdesk/);
     expect(rendered).toMatch(/read-only upstream reference/i);
     expect(rendered).toMatch(/redaction/i);
     expect(result.templateSource === 'canonical' || result.templateSource === 'embedded').toBe(true);

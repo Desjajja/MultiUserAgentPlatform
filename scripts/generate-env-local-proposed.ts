@@ -60,6 +60,16 @@ PHOENIX_PROJECT_NAME=muap-local
 GRAFANA_HOST_PORT=3001
 `;
 
+const BRANCH_DEFAULT_FRONTDESK_SECTION = `# -----------------------------------------------------------------------------
+# Branch default frontdesk policy (MUAP local; see ADR-0019)
+# -----------------------------------------------------------------------------
+# The dxy-dev branch already defaults to frontlane-lab-frontdesk when
+# ENTERPRISE_FRONTDESK_FOLDER is unset.
+# main and unknown branches keep frontlane-template-frontdesk.
+# Uncomment ENTERPRISE_FRONTDESK_FOLDER only when you need an explicit runtime
+# override that should beat the branch default.
+`;
+
 /**
  * Embedded fallback copy of the Phase 0a env template.
  *
@@ -220,6 +230,17 @@ function appendObservabilitySection(content: string): string {
   return `${content.replace(/\s*$/, '\n')}\n${OBSERVABILITY_SECTION}`;
 }
 
+function appendBranchDefaultFrontdeskSection(content: string): string {
+  if (
+    content.includes('dxy-dev branch already defaults to frontlane-lab-frontdesk') &&
+    content.includes('main and unknown branches keep frontlane-template-frontdesk')
+  ) {
+    return content;
+  }
+
+  return `${content.replace(/\s*$/, '\n')}\n${BRANCH_DEFAULT_FRONTDESK_SECTION}`;
+}
+
 /**
  * Extract the set of `KEY=...` variable names from a dotenv-like blob.
  * Lines beginning with `#` or matching `# KEY=...` are skipped because
@@ -288,7 +309,7 @@ export interface RunResult {
 export async function run(argv: string[]): Promise<RunResult> {
   const args = parseArgs(argv);
   const { source, content, from } = loadTemplate(args.templatePath);
-  const renderedContent = appendObservabilitySection(content);
+  const renderedContent = appendBranchDefaultFrontdeskSection(appendObservabilitySection(content));
 
   fs.mkdirSync(path.dirname(args.outputPath), { recursive: true });
   fs.writeFileSync(args.outputPath, renderedContent, 'utf-8');
