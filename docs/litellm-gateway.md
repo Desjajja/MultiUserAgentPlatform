@@ -4,7 +4,7 @@
 > **目的**：定义 MUAP 如何通过 LiteLLM Proxy 统一 LLM 可观测性、路由、成本追踪。本文件是 LLM 参考文档（coding agent 必读），不是人类审阅报告。
 > **状态**：v1.0（binding · 2026-06-01）
 > **依据**：[ADR-0016](decisions/ADR-0016-litellm-proxy-gateway.md)
-> **关联**：[`docs/observability-span-schema.md`](./observability-span-schema.md) §5b.7–§5b.8、[`infra/observability/README.md`](../infra/observability/README.md)
+> **关联**：[`docs/specs/observability.md`](./specs/observability.md) §5b.7–§5b.8、[`infra/observability/README.md`](../infra/observability/README.md)
 
 ---
 
@@ -345,7 +345,7 @@ curl -H "Authorization: Bearer sk-litellm-local-only" http://localhost:4000/v1/m
 
 - [ADR-0016](decisions/ADR-0016-litellm-proxy-gateway.md) — 本方案的架构决策记录
 - [ADR-0011](decisions/ADR-0011-host-otel-instrumentation.md) — Host OTel instrumentation
-- [`docs/observability-span-schema.md`](./observability-span-schema.md) §5b.7–§5b.8 — LiteLLM + Container span 规范
+- [`docs/specs/observability.md`](./specs/observability.md) §5b.7–§5b.8 — LiteLLM + Container span 规范
 - [`infra/observability/README.md`](../infra/observability/README.md) — Observability stack 运维手册
 - LiteLLM Proxy docs: https://docs.litellm.ai/docs/proxy
 - LiteLLM Phoenix callback: https://docs.litellm.ai/docs/proxy/logging#arize-phoenix

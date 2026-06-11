@@ -76,7 +76,7 @@ container/agent-runner/src/observability/propagate.ts   — traceparent 注入 h
 container/agent-runner/src/providers/openai.ts          — fetch headers 添加 traceparent
 container/agent-runner/package.json             — 新增 @opentelemetry/* 依赖
 src/router.ts                                   — 新增业务标签属性
-docs/observability-span-schema.md               — 新增 §5b.7 LiteLLM span layer + §5b.8 Container OTel spans
+docs/specs/observability.md               — 新增 §5b.7 LiteLLM span layer + §5b.8 Container OTel spans
 docs/decisions/ADR-0016-litellm-proxy-gateway.md
 docs/decisions/README.md
 ```
@@ -101,7 +101,7 @@ Phoenix trace tree 验收：发送一条消息后，Phoenix 中可见完整 `Hos
 
 - [ADR-0009: Observability Bootstrap Contract](ADR-0009-observability-bootstrap-contract.md)
 - [ADR-0011: Host OpenTelemetry Instrumentation](ADR-0011-host-otel-instrumentation.md)
-- [ADR-0014: Observability Span Naming Schema](ADR-0014-observability-span-schema.md)
+- [ADR-0014: Observability Span Naming Schema](ADR-0014-observability-span-schema.md)（spec 已合并至 `docs/specs/observability.md`）
 - LiteLLM Proxy 文档：https://docs.litellm.ai/docs/proxy
 - LiteLLM Phoenix 集成：https://docs.litellm.ai/docs/proxy/logging#arize-phoenix
 - OpenInference semantic conventions：https://github.com/Arize-ai/openinference

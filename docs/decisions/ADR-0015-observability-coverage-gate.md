@@ -11,7 +11,7 @@
 
 ## Context
 
-ADR-0014 made `docs/observability-span-schema.md` v1.0 the binding contract for manual span names, namespaces, and OpenInference attribute expectations. Wave A of PR-O2 phase 2 then migrated the existing host span surface to that schema. At that point the runtime was aligned, but the alignment remained fragile: a future PR could still introduce an unregistered namespace, forget a `openinference.span.kind`, or remove a required Keep/Rename target without any CI signal.
+ADR-0014 made `docs/specs/observability.md` v1.0 the binding contract for manual span names, namespaces, and OpenInference attribute expectations. Wave A of PR-O2 phase 2 then migrated the existing host span surface to that schema. At that point the runtime was aligned, but the alignment remained fragile: a future PR could still introduce an unregistered namespace, forget a `openinference.span.kind`, or remove a required Keep/Rename target without any CI signal.
 
 Known constraints at decision time:
 
@@ -55,7 +55,7 @@ The accepted gate:
 ## Implementation Notes
 
 - Landed files: `scripts/observability-coverage-lib.ts`, `scripts/observability-coverage.test.ts`, `scripts/generate-observability-coverage-report.ts`, `reports/human/observability-coverage-2026-05-31.html`, `package.json`
-- Parent decisions: `docs/decisions/ADR-0011-host-otel-instrumentation.md`, `docs/decisions/ADR-0014-observability-span-schema.md`
+- Parent decisions: `docs/decisions/ADR-0011-host-otel-instrumentation.md`, `docs/decisions/ADR-0014-observability-span-schema.md`（spec 已合并至 `docs/specs/observability.md`）
 - Direct operator entrypoint: `pnpm obs:coverage`
 - Ongoing acceptance points:
   - `pnpm obs:coverage` passes on current host runtime
@@ -66,8 +66,8 @@ The accepted gate:
 ## References
 
 - `docs/decisions/ADR-0011-host-otel-instrumentation.md`
-- `docs/decisions/ADR-0014-observability-span-schema.md`
-- `docs/observability-span-schema.md`
+- `docs/decisions/ADR-0014-observability-span-schema.md`（spec 已合并至 `docs/specs/observability.md`）
+- `docs/specs/observability.md`
 - `scripts/observability-coverage.test.ts`
 - `scripts/observability-coverage-lib.ts`
 - `reports/human/observability-coverage-2026-05-31.html`

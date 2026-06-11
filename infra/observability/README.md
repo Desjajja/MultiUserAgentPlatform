@@ -2,7 +2,7 @@
 
 > 本目录是 MUAP **Phase 0b / PR-O1** 的 observability 基础设施落地点。仅提供 Phoenix OSS + Grafana 的 compose / provisioning / 占位 dashboards / 运维脚本，不包含任何 host 或 runner 的 instrumentation 代码。
 >
-> 上游决议：[ADR-0007](../../docs/decisions/ADR-0007-observability-phoenix-grafana.md)（观测栈选型）→ [ADR-0009](../../docs/decisions/ADR-0009-observability-bootstrap-contract.md)（本 PR 落地合同）。
+> 上游决议：[ADR-0007](../../docs/decisions/ADR-0007-observability-phoenix-grafana.md)（观测栈选型）→ [ADR-0009](../../docs/decisions/ADR-0009-observability-bootstrap-contract.md)（本 PR 落地合同）→ [ADR-0017](../../docs/decisions/ADR-0017-observability-phoenix17-route-type-taxonomy.md)（Phoenix 17 升级 + metadata 过滤）→ [ADR-0018](../../docs/decisions/ADR-0018-observability-business-first-tracing.md)（business-first tracing：`interaction.*` 根 span + `span_scope` 主过滤维度）。
 
 ## 目的（Purpose）
 
@@ -43,11 +43,26 @@
 
 | 服务 | tag |
 |---|---|
-| Phoenix | `arizephoenix/phoenix:version-8.0.0` |
+| Phoenix | `arizephoenix/phoenix:version-17.2.0` |
 | Postgres | `postgres:16` |
 | Grafana | `grafana/grafana:11.0.0` |
 
 > 严禁使用 `:latest`。`scripts/observability-bootstrap.test.ts` 会校验 pin。
+>
+> Phoenix 已从 `version-8.0.0` 升级到 `version-17.2.0`（见 [ADR-0017](../../docs/decisions/ADR-0017-observability-phoenix17-route-type-taxonomy.md)），以启用 `metadata` 一等公民过滤等高级查询能力。
+
+### 17.x 安全硬化 env（Hardening Flags）
+
+prod + sim 的 `phoenix.environment` 均加入以下 4 个 17.x 安全硬化开关（均经 Phoenix 源码 `src/phoenix/config.py` 核实为真实变量）：
+
+| env | 值 | 作用 |
+|---|---|---|
+| `PHOENIX_ALLOW_EXTERNAL_RESOURCES` | `false` | 禁止 UI 加载外部资源（Google Fonts 等），同时收紧 agent web 访问 |
+| `PHOENIX_TELEMETRY_ENABLED` | `false` | 关闭 Phoenix 自身的使用分析 pixel（FullStory / Scarf.sh）；不影响 OTel trace 采集 |
+| `PHOENIX_ALLOWED_PROVIDERS` | `NONE` | 隐藏 playground 全部 LLM provider（本栈纯观测，无 playground 用途） |
+| `PHOENIX_AGENTS_DISABLE_WEB_ACCESS` | `true` | 禁用内建 agent 的 web search / fetch 能力 |
+
+> 注：早期计划稿曾写 `PHOENIX_DISABLE_AGENT_ASSISTANT`，该变量在 Phoenix 中**不存在**；已用真实变量 `PHOENIX_AGENTS_DISABLE_WEB_ACCESS` 替代（见 ADR-0017）。
 
 ## 起停 / 日志 / 配置 / 重置（Operator Commands）
 
@@ -181,6 +196,48 @@ GRAFANA_HOST_PORT=3001
    ```bash
    pnpm obs:down
    ```
+
+## 业务标签过滤验证（Business-Tag Filter QA）
+
+> Phoenix 17.2.0 + `metadata` 命名空间落地后的手工验证。前置：完整链路已发过至少一条消息。
+>
+> **v2.0 更新（ADR-0018）**：主要过滤维度从 `metadata["layer"]` / `metadata["route_type"]` 迁移到 `metadata["span_scope"]` + span 名称。业务根 span 从 `router.deliver_to_agent` 迁移到 `interaction.frontdesk` / `interaction.worker`。详见 ADR-0018 与 `docs/specs/observability.md` v2.0。
+
+1. UI 过滤（Phoenix Spans 标签页 filter bar，`metadata` 为一等公民）：
+   ```
+   # 主要业务过滤（Sessions 视图干净的唯一来源）
+   metadata["span_scope"] == "business"
+
+   # 按 lane 过滤
+   name == "interaction.frontdesk"
+   name == "interaction.worker"
+
+   # A2A 派活轮次
+   metadata["engage_mode"] == "a2a"
+
+   # 仅平台 span
+   metadata["span_scope"] == "platform"
+   ```
+   期望：`span_scope == "business"` 能筛出带完整 `input.value`/`output.value` 的业务根 span；`span_scope == "platform"` 能筛出 delivery / container / channel 等基础设施 span。
+
+2. REST API 过滤（≥14.9.0 支持）：
+   ```bash
+   # attribute=metadata.span_scope:business
+   ```
+   期望：返回带 `span_scope=business` 的 spans。
+
+3. Postgres 直查（Grafana / psql）：
+   ```sql
+   -- 查业务轮次，含用户问题和 agent 答复摘要
+   SELECT name, span_kind,
+     left(attributes->>'input.value', 60) AS question,
+     left(attributes->>'output.value', 60) AS answer,
+     attributes->'metadata'->>'route_label' AS route_label
+   FROM spans
+   WHERE attributes->'metadata'->>'span_scope' = 'business'
+   ORDER BY start_time DESC LIMIT 10;
+   ```
+   期望：`name` 为 `interaction.frontdesk` 或 `interaction.worker`；`route_label` 反映真实 lane；`input.value` / `output.value` 包含完整对话内容。
 
 ## 故障排查（Troubleshooting）
 

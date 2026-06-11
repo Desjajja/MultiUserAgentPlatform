@@ -225,6 +225,185 @@ FrontLane does not try to be:
 - a replacement for backend authorization
 - a shared global memory for all employees
 
+## Observability Spec
+
+FrontLane observability 统一遵循 `docs/specs/observability.md`。它涵盖：
+
+- Span 命名 schema（19 个 top-level namespace，2-3 段 lowercase snake_case）
+- OpenInference 属性矩阵（`openinference.span.kind`、`session.id`、`input.value`/`output.value`）
+- Business tag taxonomy（`metadata.span_scope`、`route_label`、`turn_result`）
+- Trace 拓扑规则（`interaction.*` 业务根 span、pre-session 分离、W3C traceparent 跨进程传播）
+- 反噪声纪律（no-empty-loop guard、禁止 duplicate spans）
+
+**约束**：任何新增 manual span 必须经过 schema review；新增 top-level namespace 需要 ADR。
+
+## Model Registry（ADR-0020）
+
+### 模型配置统一入口
+
+模型配置从分散的 `.env` + `litellm/config.yaml` + provider 硬编码，迁移到 `model-registry/` 的 YAML Profile Registry：
+
+```yaml
+profile:
+  id: "deepseek-v4-flash"
+  display_name: "DeepSeek V4 Flash"
+  provider: "openai"
+  family: "deepseek"
+
+endpoint:
+  base_url: "https://opencode.ai/zen/go/v1"
+  api_key_env: "OPENAI_API_KEY"
+  model_path: "openai/deepseek-v4-flash"
+
+capabilities:
+  reasoning: true
+  streaming: false
+  tool_calls: true
+  vision: false
+  max_context_tokens: 128000
+  max_output_tokens: 8192
+
+reasoning:
+  effort_levels: ["none", "low", "medium", "high"]
+  default_effort: "none"
+  capture_reasoning_content: true
+  capture_strategy: "dual_message_split"
+  custom_attribute_prefix: "custom.reasoning"
+
+cost:
+  pricing:
+    input_tokens: 0.10
+    output_tokens: 0.30
+    reasoning_tokens: 0.30
+    cache_read_tokens: 0.05
+  billable_dimensions: ["input_tokens", "output_tokens", "reasoning_tokens"]
+  cost_precision: 6
+
+phoenix:
+  model_name_in_phoenix: "deepseek-v4-flash"
+  auto_push_pricing: true
+```
+
+### 配置加载优先级
+
+1. `MODEL_PROFILE=deepseek-v4-flash` → 加载 `model-registry/profiles/deepseek-v4-flash.yaml`
+2. `OPENAI_MODEL=deepseek-v4-flash`（无 `MODEL_PROFILE`）→ 查询 `model-registry/index.yaml` 的 `env_overrides` 映射
+3. 无环境变量 → 使用 `model-registry/index.yaml` 的 `default_profile`
+
+### 新增目录结构
+
+```
+model-registry/
+├── index.yaml
+├── profiles/
+│   ├── deepseek-v4-flash.yaml
+│   ├── gpt-4o.yaml
+│   └── claude-sonnet-4.yaml
+└── pricing/
+    └── base-pricing.yaml
+```
+
+## 上下文可见性 + 推理/成本追踪（ADR-0020）
+
+### 上下文可见性
+
+| 维度 | Phoenix 原生 | MUAP 补充 |
+|---|---|---|
+| Input/Output messages | `llm.input_messages` / `llm.output_messages` | 不需要 |
+| System prompt | 通过 `role="system"` 显示 | 确保 `instructions` 正确传入 |
+| Token 统计 | `gen_ai.usage.*`（LiteLLM 自动） | 不需要 |
+| Prompt 版本 | Phoenix Prompts 管理 | `llm.prompt_template.*` 属性注入 |
+| 上下文组装链路 | 不支持 | 建议 `context.assembly` 自定义 span |
+
+### 推理内容捕获
+
+当 `capture_reasoning_content: true` 时，采用**双消息拆分 workaround**：
+
+```typescript
+const outputMessages = [
+  { role: "assistant", content: reasoningContent },  // 推理过程
+  { role: "assistant", content: finalAnswer },       // 最终答案
+];
+```
+
+等 OpenInference PR #1642 落地后，迁移到原生 `message.reasoning_content`。
+
+### 成本追踪
+
+新增 `UsageEvent` 字段：
+
+```typescript
+interface UsageEvent {
+  type: 'usage';
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;      // 新增
+  reasoningContent?: string;     // 新增
+  costEstimate?: number;         // 新增（基于 profile 定价本地计算）
+  durationMs?: number;
+  transport?: string;
+  modelProfile?: string;         // 新增
+}
+```
+
+成本计算函数：
+
+```typescript
+export function calculateCost(profile, usage) {
+  const pricing = profile.cost?.pricing;
+  if (!pricing) return { totalCost: 0, currency: 'USD' };
+  const inputCost = (usage.inputTokens / 1_000_000) * pricing.input_tokens;
+  const outputCost = (usage.outputTokens / 1_000_000) * pricing.output_tokens;
+  const reasoningCost = usage.reasoningTokens
+    ? (usage.reasoningTokens / 1_000_000) * (pricing.reasoning_tokens || pricing.output_tokens)
+    : 0;
+  return {
+    inputCost: Number(inputCost.toFixed(6)),
+    outputCost: Number(outputCost.toFixed(6)),
+    reasoningCost: Number(reasoningCost.toFixed(6)),
+    totalCost: Number((inputCost + outputCost + reasoningCost).toFixed(6)),
+    currency: 'USD',
+  };
+}
+```
+
+## Prompt 版本追踪（ADR-0020）
+
+### 设计原则
+
+- **Registry 不替代 Prompts**：Model Registry 管理模型接入配置，Phoenix Prompts 管理提示词模板
+- **运行时依赖**：Prompt 版本信息在运行时注入 trace，不阻塞 LLM 调用（Phoenix 不可用则 fallback 到本地版本号）
+- **向后兼容**：现有硬编码 `instructions` 继续有效，逐步迁移到 Phoenix Prompts 管理
+
+### 运行时注入
+
+```typescript
+span.setAttribute('llm.prompt_template.name', promptName);
+span.setAttribute('llm.prompt_template.version', versionId);
+span.setAttribute('llm.prompt_template.variables', JSON.stringify(variables));
+span.setAttribute('llm.prompt_template.tag', tag);
+```
+
+### 追踪维度
+
+| 属性 | 来源 | 用途 |
+|---|---|---|
+| `llm.prompt_template.name` | Phoenix Prompt identifier | 追踪使用了哪个 prompt |
+| `llm.prompt_template.version` | Phoenix Prompt version ID | 追踪具体版本 |
+| `llm.prompt_template.variables` | 运行时变量 | 追踪变量值（注意敏感信息脱敏） |
+| `llm.prompt_template.tag` | Phoenix Tag（production/staging） | 追踪环境 |
+
+### 与 Model Registry 集成
+
+```yaml
+# model-registry/profiles/*.yaml
+prompts:
+  default_prompt: "frontlane-frontdesk-system"
+  supported_tags: ["production", "staging", "experimental"]
+```
+
 ## Naming and Compatibility
 
 Some low-level script names, env vars, metric names, and migration notes still use legacy identifiers inherited from the original fork history. Those are treated as transitional — the active product identity, default enterprise topology, and current docs all use `FrontLane`.

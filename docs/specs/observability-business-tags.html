@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MUAP 业务标签 Schema v1.3</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --accent-bg: #1f6feb33;
+      --code-bg: #161b22;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+      --table-header: #21262d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+    }
+    h1, h2, h3 { color: var(--fg); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+    h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 1.5rem; margin-top: 2rem; }
+    h3 { font-size: 1.2rem; margin-top: 1.5rem; color: var(--accent); border: none; }
+    .subtitle { color: #8b949e; font-size: 1.1rem; margin-bottom: 2rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      border-radius: 12px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-right: 0.5rem;
+    }
+    .badge-ai { background: var(--accent-bg); color: var(--accent); }
+    .badge-platform { background: #23863633; color: var(--success); }
+    .badge-required { background: #f8514933; color: var(--danger); }
+    .badge-optional { background: #8b949e33; color: #8b949e; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      background: var(--code-bg);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--table-header);
+      font-weight: 600;
+      color: var(--accent);
+    }
+    tr:hover { background: rgba(255,255,255,0.03); }
+    code {
+      font-family: 'SFMono-Regular', 'Monaco', 'Consolas', monospace;
+      background: var(--code-bg);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+      color: var(--accent);
+    }
+    pre {
+      background: var(--code-bg);
+      padding: 1rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+    }
+    .layer-section {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin: 1rem 0;
+    }
+    .warning-box {
+      background: #d2992233;
+      border-left: 4px solid var(--warning);
+      padding: 1rem;
+      margin: 1rem 0;
+      border-radius: 0 8px 8px 0;
+    }
+    .success-box {
+      background: #3fb95033;
+      border-left: 4px solid var(--success);
+      padding: 1rem;
+      margin: 1rem 0;
+      border-radius: 0 8px 8px 0;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+    .status-card {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .status-card h4 {
+      margin-top: 0;
+      color: var(--accent);
+    }
+    .status-done { color: var(--success); }
+    .status-pending { color: var(--warning); }
+    .status-missing { color: var(--danger); }
+    .filter-example {
+      background: #1f2937;
+      border-radius: 8px;
+      padding: 1rem;
+      margin: 0.5rem 0;
+      font-family: monospace;
+      font-size: 0.9rem;
+    }
+    .filter-label {
+      color: #8b949e;
+      font-size: 0.85rem;
+      margin-bottom: 0.5rem;
+    }
+    hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+  </style>
+</head>
+<body>
+
+<h1>MUAP 业务标签 Schema（v1.3）</h1>
+<p class="subtitle">用途：为 Arize Phoenix 提供可按业务维度过滤的 trace/span 元数据</p>
+
+<div class="success-box">
+  <strong>适用范围</strong>：所有 host-side 和 container-side observability spans<br>
+  <strong>过滤承载</strong>：OpenInference <strong><code>metadata</code></strong> 命名空间（单个 <code>metadata</code> JSON attribute），<strong>不再</strong>使用 flat <code>muap.*</code> attribute key<br>
+  <strong>关联 ADR</strong>：ADR-0017（Phoenix 17.2.0 + metadata 迁移 + route_type taxonomy）
+</div>
+
+<hr>
+
+<h2>0. v1.3 关键变更（必读）</h2>
+
+<table>
+  <tr><th>维度</th><th>v1.2（旧）</th><th>v1.3（当前）</th></tr>
+  <tr><td>过滤承载</td><td>flat <code>muap.*</code> attribute key</td><td>OpenInference <code>metadata</code> 命名空间</td></tr>
+  <tr><td>host 编码</td><td><code>span.setAttribute('muap.*', ...)</code></td><td><code>span.setAttributes(getMetadataAttributes({ layer: ... }))</code></td></tr>
+  <tr><td>container 编码</td><td>hardcode <code>muap.*</code></td><td>本地 helper 输出 <code>{ metadata: JSON.stringify(...) }</code></td></tr>
+  <tr><td>UI 过滤</td><td><code>attributes["muap"]["layer"]</code>（<code>attributes</code> 非合法 UI 过滤字段）</td><td><code>metadata["layer"] == "ai"</code>（一等公民）</td></tr>
+  <tr><td><code>route_type</code> 合法值</td><td><code>frontdesk / worker / a2a / system</code></td><td><code>frontdesk / worker / erp / system</code>（删 <code>a2a</code>，加 <code>erp</code> reserved）</td></tr>
+  <tr><td><code>a2a</code> 语义</td><td><code>route_type='a2a'</code></td><td>仅 <code>engage_mode='a2a'</code></td></tr>
+  <tr><td>Phoenix 版本</td><td><code>8.0.0</code></td><td><code>17.2.0</code></td></tr>
+</table>
+
+<div class="warning-box">
+  <strong>为什么迁移到 metadata</strong>：Phoenix 图形化过滤界面中 <code>attributes</code> 不是合法过滤字段，flat <code>muap.*</code> 无法在 UI 过滤；而 <code>metadata</code> 是 Phoenix 一等公民过滤字段（官方文档示例 <code>metadata["topic"] == 'programming'</code>）。详见 ADR-0017。
+</div>
+
+<hr>
+
+<h2>1. 分层架构（Layer Separation）</h2>
+
+<div class="layer-section">
+  <h3>1.1 AI 语义层（AI Semantic Layer）</h3>
+  <p>面向模型分析、prompt 调试、工具使用统计。</p>
+  <table>
+    <tr><th>Span 名称</th><th>OpenInference Kind</th><th>说明</th></tr>
+    <tr><td><code>router.deliver_to_agent</code></td><td><code>AGENT</code></td><td>用户一次交互的入口，包含 input/output</td></tr>
+    <tr><td><code>agent.turn</code></td><td><code>CHAIN</code></td><td>容器内一次推理周期（prompt → LLM → tool → output）</td></tr>
+    <tr><td>LiteLLM auto-spans</td><td><code>LLM</code> / <code>TOOL</code> / <code>PROMPT</code></td><td>由 LiteLLM Proxy 自动生成</td></tr>
+  </table>
+  <p><strong>metadata</strong>：<code>layer = 'ai'</code></p>
+</div>
+
+<div class="layer-section">
+  <h3>1.2 平台遥测层（Platform Telemetry Layer）</h3>
+  <p>面向平台工程、容器生命周期、消息投递延迟调试。</p>
+  <table>
+    <tr><th>Span 名称</th><th>OpenInference Kind</th><th>说明</th></tr>
+    <tr><td><code>channel.cli.receive</code></td><td><code>CHAIN</code></td><td>CLI 通道消息接收</td></tr>
+    <tr><td><code>channel.feishu.receive</code></td><td><code>CHAIN</code></td><td>飞书通道消息接收</td></tr>
+    <tr><td><code>router.route</code></td><td><code>CHAIN</code></td><td>消息路由决策</td></tr>
+    <tr><td><code>container.wake</code></td><td><code>CHAIN</code></td><td>容器唤醒</td></tr>
+    <tr><td><code>container.spawn</code></td><td><code>CHAIN</code></td><td>容器创建</td></tr>
+    <tr><td><code>container.kill</code></td><td><code>CHAIN</code></td><td>容器终止</td></tr>
+    <tr><td><code>delivery.session.drain</code></td><td><code>CHAIN</code></td><td>会话消息批量消费</td></tr>
+    <tr><td><code>delivery.message.deliver</code></td><td><code>CHAIN</code></td><td>单条消息投递</td></tr>
+    <tr><td><code>delivery.channel.send</code></td><td><code>CHAIN</code></td><td>通道消息发送（含 output.value）</td></tr>
+  </table>
+  <p><strong>metadata</strong>：<code>layer = 'platform'</code></p>
+</div>
+
+<hr>
+
+<h2>2. 业务标签注册表（Business Tag Registry）</h2>
+<p>所有业务维度作为 key 写入<strong>单个 <code>metadata</code> JSON 对象</strong>，再编码为 span 的 <code>metadata</code> attribute。<br>内部 key <strong>不带</strong> <code>muap.</code> 前缀（前缀语义由 <code>metadata</code> 命名空间本身承担）。</p>
+
+<h3>2.1 核心标签（所有 span 必须携带）</h3>
+<table>
+  <tr><th>metadata key</th><th>类型</th><th>必填</th><th>合法值</th><th>说明</th></tr>
+  <tr><td><code>layer</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>ai</code> / <code>platform</code></td><td>区分 AI 语义与平台遥测</td></tr>
+</table>
+
+<h3>2.2 路由标签（Routing Spans）</h3>
+<table>
+  <tr><th>metadata key</th><th>类型</th><th>必填</th><th>合法值</th><th>说明</th></tr>
+  <tr><td><code>route_type</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>frontdesk</code> / <code>worker</code> / <code>erp</code> / <code>system</code></td><td>路由类型（<code>erp</code> 当前 reserved，无运行时发射点）</td></tr>
+  <tr><td><code>lane</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>frontdesk</code> / <code>worker</code></td><td>业务车道</td></tr>
+  <tr><td><code>channel</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>cli</code> / <code>feishu</code> / <code>webhook</code> / <code>unknown</code></td><td>入口渠道</td></tr>
+  <tr><td><code>intent</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>chat</code> / <code>approval</code> / <code>execute</code> / <code>system</code></td><td>用户意图</td></tr>
+</table>
+
+<div class="warning-box">
+  <strong><code>route_type</code> 内容绑定语义</strong>：<code>route_type</code> 绑定到<strong>内容相关 span</strong>（<code>router.deliver_to_agent</code> / <code>agent.turn</code>），代表"该路由下的实际回复内容"，而非单纯的路由动作。用户按 <code>route_type</code> 过滤时，期望看到的是该 lane 的真实对话内容。
+</div>
+
+<h3>2.3 会话标签（Session Spans）</h3>
+<table>
+  <tr><th>metadata key</th><th>类型</th><th>必填</th><th>合法值</th><th>说明</th></tr>
+  <tr><td><code>agent_group</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td>任意</td><td>Agent Group 名称，如 <code>Demo</code></td></tr>
+  <tr><td><code>session_mode</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td>任意</td><td>会话模式，如 <code>shared</code> / <code>per-user</code></td></tr>
+  <tr><td><code>engage_mode</code></td><td>string</td><td><span class="badge badge-required">✅</span></td><td><code>direct</code> / <code>a2a</code></td><td>交互模式（<strong><code>a2a</code> 的唯一承载点</strong>）</td></tr>
+</table>
+
+<h3>2.4 提供者标签（Provider Spans）</h3>
+<table>
+  <tr><th>metadata key</th><th>类型</th><th>必填</th><th>合法值</th><th>说明</th></tr>
+  <tr><td><code>provider</code></td><td>string</td><td><span class="badge badge-optional">条件</span></td><td><code>claude</code> / <code>openai</code> / <code>sdk-openai</code> / ...</td><td>AI 模型提供者</td></tr>
+</table>
+
+<h3>2.5 失败标签（Failure Spans）</h3>
+<table>
+  <tr><th>metadata key</th><th>类型</th><th>必填</th><th>合法值</th><th>说明</th></tr>
+  <tr><td><code>failure_category</code></td><td>string</td><td><span class="badge badge-optional">条件</span></td><td>如 <code>provider_timeout</code> / <code>auth_denied</code> / <code>container_oom</code></td><td>稳定的业务级失败分类，配合 <code>status.code=ERROR</code> + <code>recordException</code> 使用（v1.3：取代 flat <code>muap.failure.category</code>，因 <code>attributes</code> 在 Phoenix UI 不可过滤）</td></tr>
+</table>
+
+<hr>
+
+<h2>3. 标签设置位置（Setting Locations）</h2>
+
+<div class="success-box">
+  下列各 span 的 metadata key 通过 <code>applyBusinessTags(span, {...})</code>（host）或 container 本地 helper 写入，最终编码为单个 <code>metadata</code> JSON attribute。
+</div>
+
+<pre><code>router.deliver_to_agent (AGENT)
+  metadata.layer = 'ai'
+  metadata.route_type = 'frontdesk'   # 派活到 worker 时为 'worker'（按目标 lane 派生）
+  metadata.lane = 'frontdesk'
+  metadata.channel = 'cli' | 'feishu'
+  metadata.intent = 'chat'
+  metadata.agent_group = 'Demo'
+  metadata.session_mode = 'shared'
+  metadata.engage_mode = 'direct' | 'a2a'
+
+agent.turn (CHAIN, container-side)
+  metadata.layer = 'ai'
+  metadata.route_type = &lt;FRONTLANE_ROUTE_TYPE 派生&gt;   # 不再 hardcode 'worker'
+  metadata.lane = &lt;派生&gt;
+  metadata.provider = 'sdk-openai' | 'claude'
+  # session.id 为 OpenInference 语义字段（真实 attribute），由 FRONTLANE_SESSION_ID 注入，不再为 'unknown'
+
+container.wake | container.spawn | container.kill
+  metadata.layer = 'platform'
+  metadata.route_type = &lt;按 session lane 派生&gt;
+  metadata.lane = &lt;派生&gt;
+  metadata.provider = 'sdk-openai'（仅 spawn）
+
+delivery.session.drain | delivery.message.deliver | delivery.channel.send
+  metadata.layer = 'platform'
+  metadata.route_type = 'worker'
+  metadata.lane = 'worker'
+
+channel.cli.receive | channel.feishu.receive
+  metadata.layer = 'platform'
+  metadata.route_type = 'frontdesk'
+  metadata.lane = 'frontdesk'
+  metadata.channel = 'cli' | 'feishu'
+
+router.route
+  metadata.layer = 'platform'
+  metadata.route_type = 'frontdesk'
+  metadata.lane = 'frontdesk'
+  metadata.channel = event.channelType</code></pre>
+
+<div class="warning-box">
+  <strong>OpenInference 语义字段保留为真实 attribute（不进 metadata）</strong>：<code>session.id</code>、<code>agent.group.id</code>、<code>output.value</code>、<code>output.mime_type</code>、<code>openinference.span.kind</code> 等是 OpenInference 标准语义字段，继续作为普通 OTel attribute 写入，不放入 <code>metadata</code>。
+</div>
+
+<hr>
+
+<h2>4. Phoenix 过滤语法参考（Phoenix 17.2.0）</h2>
+
+<div class="success-box">
+  <strong>关键点</strong>：业务维度存储在 <code>metadata</code> 中（Phoenix 一等公民过滤字段）。三路过滤（UI / REST / SQL）均可用。
+</div>
+
+<h3>4.1 UI Filter Bar（Spans 标签页）</h3>
+<p>使用 Python 布尔表达式，直接用 <code>metadata["key"]</code> 访问：</p>
+
+<div class="filter-example">
+  <div class="filter-label">按 layer 过滤</div>
+  metadata["layer"] == "ai"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按路由类型过滤（看 frontdesk 实际回复内容）</div>
+  metadata["route_type"] == "frontdesk"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按业务车道过滤</div>
+  metadata["lane"] == "worker"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按渠道过滤</div>
+  metadata["channel"] == "cli"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按 provider 过滤</div>
+  metadata["provider"] == "sdk-openai"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">组合过滤（AND 关系）</div>
+  metadata["layer"] == "ai" and metadata["route_type"] == "frontdesk"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按 a2a 派活过滤（engage_mode 是 a2a 的唯一承载）</div>
+  metadata["engage_mode"] == "a2a"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按 OpenInference kind 过滤（必须大写）</div>
+  span_kind == "AGENT"
+</div>
+
+<div class="filter-example">
+  <div class="filter-label">按 span 名称过滤</div>
+  name == "agent.turn"
+</div>
+
+<div class="warning-box">
+  Phoenix 官方：<code>metadata["topic"] == 'programming'</code> 是文档示例；"Any expressions that work with the <code>.where()</code> method can also be used in the UI"。
+</div>
+
+<h3>4.2 REST API（Phoenix &gt;= 14.9.0 支持，17.2.0 可用）</h3>
+<pre><code>attribute=metadata.route_type:frontdesk</code></pre>
+
+<h3>4.3 PostgreSQL 直接查询</h3>
+<pre><code class="language-sql">-- 查 AI 语义层 spans
+SELECT name, span_kind, start_time
+FROM spans
+WHERE attributes-&gt;'metadata'-&gt;&gt;'layer' = 'ai'
+ORDER BY start_time DESC
+LIMIT 20;
+
+-- 按路由类型 + 渠道组合
+SELECT name, span_kind, attributes-&gt;'metadata'-&gt;&gt;'channel' AS channel
+FROM spans
+WHERE attributes-&gt;'metadata'-&gt;&gt;'route_type' = 'frontdesk'
+  AND attributes-&gt;'metadata'-&gt;&gt;'channel' = 'cli'
+ORDER BY start_time DESC;
+
+-- 查所有已设置 metadata 业务维度的 spans
+SELECT
+  name,
+  span_kind,
+  attributes-&gt;'metadata'-&gt;&gt;'layer' AS layer,
+  attributes-&gt;'metadata'-&gt;&gt;'route_type' AS route_type,
+  attributes-&gt;'metadata'-&gt;&gt;'provider' AS provider
+FROM spans
+WHERE attributes-&gt;'metadata' IS NOT NULL
+ORDER BY start_time DESC
+LIMIT 50;</code></pre>
+
+<pre><code class="language-bash"># 一行命令查询
+docker exec muap-observability-prod-postgres-1 psql -U phoenix -d phoenix -c \
+  "SELECT name, span_kind, attributes-&gt;'metadata'-&gt;&gt;'layer' AS layer FROM spans \
+   WHERE attributes-&gt;'metadata'-&gt;&gt;'layer' = 'ai' ORDER BY start_time DESC LIMIT 10;"</code></pre>
+
+<div class="warning-box">
+  <strong>注意</strong>：<code>metadata</code> 在 OpenInference 中被编码为 JSON <strong>字符串</strong> attribute（<code>getMetadataAttributes</code> 产出 <code>{ metadata: JSON.stringify(...) }</code>）。Phoenix 17.x 摄取后在 Postgres 中以 JSONB 形式可用 <code>attributes-&gt;'metadata'-&gt;&gt;'key'</code> 访问；若实际存储为字符串，需先 <code>(attributes-&gt;&gt;'metadata')::jsonb-&gt;&gt;'key'</code>。以 staging 实测为准。
+</div>
+
+<hr>
+
+<h2>5. 实现机制（为什么这样编码）</h2>
+
+<h3>5.1 host 端：<code>getMetadataAttributes</code></h3>
+<pre><code class="language-ts">import { getMetadataAttributes } from '@arizeai/openinference-core';
+// applyBusinessTags 内部：
+span.setAttributes(getMetadataAttributes({ layer: 'ai', route_type: 'frontdesk', ... }));
+// 等价于 span.setAttribute('metadata', JSON.stringify({ layer:'ai', route_type:'frontdesk', ... }))</code></pre>
+<ul>
+  <li>host 已装 <code>@arizeai/openinference-core@2.2.0</code>，无需新依赖。</li>
+  <li><code>applyBusinessTags(span, {...})</code> <strong>调用面不变</strong>，15 个 host emitter 零改动。</li>
+</ul>
+
+<h3>5.2 container 端：本地 helper</h3>
+<ul>
+  <li>container（<code>container/agent-runner/</code>）<strong>无</strong> <code>@arizeai</code> 依赖，刻意不引入以避免镜像膨胀。</li>
+  <li>使用本地 helper（<code>container/agent-runner/src/observability/metadata.ts</code>）输出等价 <code>{ metadata: JSON.stringify(record) }</code>。</li>
+</ul>
+
+<h3>5.3 为什么不用 <code>setMetadata</code> / <code>using_metadata</code></h3>
+<ul>
+  <li><code>setMetadata</code> 只把数据放进 OTel context，需 <code>OITracer</code> / auto-instrumentation 在 <code>startSpan</code> 时读取并落到 span。</li>
+  <li>本项目业务 span 全部用裸 <code>@opentelemetry/api</code> 的 <code>tracer.startSpan()</code> / <code>startActiveSpan()</code>，context metadata <strong>永远不会</strong>落到 span。</li>
+  <li>因此必须用 <code>getMetadataAttributes</code>（host）/ 本地 helper（container）<strong>显式写入</strong> <code>metadata</code> attribute。</li>
+  <li>迁移到 <code>OITracer</code> 是 future work（见 ADR-0017）。</li>
+</ul>
+
+<h3>5.4 metadata 合并注意</h3>
+<ul>
+  <li><code>metadata</code> 是<strong>单个</strong> JSON attribute。同一 span 多次写入业务维度时必须 <strong>union</strong>，不能后写覆盖先写。</li>
+  <li>实现上应累积所有维度后一次性编码，或 read-merge-rewrite。staging 需实测 span 最终携带维度并集。</li>
+</ul>
+
+<hr>
+
+<h2>6. 已知限制（Phoenix 17.2.0）</h2>
+
+<table>
+  <tr><th>限制</th><th>状态</th><th>说明</th></tr>
+  <tr><td><code>attributes</code> 作为 UI 过滤字段</td><td><span style="color: var(--danger)">❌ 不支持</span></td><td>UI filter bar 不接受 <code>attributes</code> 作为一等过滤字段；这正是迁移到 <code>metadata</code> 的根因</td></tr>
+  <tr><td>Traces 标签页过滤</td><td><span style="color: var(--danger)">❌ 仅根 span</span></td><td>Traces 视图只能按根 span 过滤；查子 span 用 Spans 视图</td></tr>
+  <tr><td>列表类型 metadata 值</td><td><span style="color: var(--danger)">❌ 不支持简单 filter</span></td><td><code>tags: ["a","b"]</code> 无法用简单 filter 匹配</td></tr>
+  <tr><td>正则匹配</td><td><span style="color: var(--danger)">❌ 不支持</span></td><td>所有 filter 为精确匹配</td></tr>
+</table>
+
+<hr>
+
+<h2>7. 实现状态</h2>
+
+<table>
+  <tr><th>组件</th><th>状态</th><th>说明</th></tr>
+  <tr><td><code>metadata.layer</code></td><td><span class="status-done">✅ 已实现</span></td><td>所有 host spans 经 <code>applyBusinessTags</code> 写入</td></tr>
+  <tr><td><code>metadata.route_type</code></td><td><span class="status-done">✅ 已实现</span></td><td>host 派生 + container 经 <code>FRONTLANE_ROUTE_TYPE</code> 派生</td></tr>
+  <tr><td><code>metadata.lane</code></td><td><span class="status-done">✅ 已实现</span></td><td>已定义并设置</td></tr>
+  <tr><td><code>metadata.channel</code></td><td><span class="status-done">✅ 已实现</span></td><td>已定义并设置</td></tr>
+  <tr><td><code>metadata.intent</code></td><td><span class="status-done">✅ 已实现</span></td><td>已定义并设置</td></tr>
+  <tr><td><code>metadata.agent_group</code></td><td><span class="status-done">✅ 已实现</span></td><td>经 metadata 写入</td></tr>
+  <tr><td><code>metadata.session_mode</code></td><td><span class="status-done">✅ 已实现</span></td><td>经 metadata 写入</td></tr>
+  <tr><td><code>metadata.engage_mode</code></td><td><span class="status-done">✅ 已实现</span></td><td><code>a2a</code> 唯一承载点</td></tr>
+  <tr><td><code>metadata.provider</code></td><td><span class="status-done">✅ 已实现</span></td><td>container.spawn / agent.turn 上设置</td></tr>
+  <tr><td><code>agent.turn</code> (container-side)</td><td><span class="status-done">✅ 已实现</span></td><td>metadata 化 + route_type 去 hardcode + session.id 真实注入</td></tr>
+  <tr><td><code>route_type = erp</code></td><td><span class="status-pending">⏳ reserved</span></td><td>taxonomy 已含，暂无运行时发射点</td></tr>
+</table>
+
+<hr>
+
+<h2>8. 变更历史</h2>
+
+<table>
+  <tr><th>版本</th><th>日期</th><th>变更</th></tr>
+  <tr><td>v1.0</td><td>2026-05</td><td>初始 schema：OpenInference span kind、命名空间、trace topology</td></tr>
+  <tr><td>v1.1</td><td>2026-06</td><td>加入 LiteLLM Proxy、容器侧 OTel、root span bridge</td></tr>
+  <tr><td>v1.2</td><td>2026-06-02</td><td>加入 layer separation、business tag taxonomy（flat <code>muap.*</code>）、agent.turn span</td></tr>
+  <tr><td><strong>v1.3</strong></td><td><strong>2026-06-07</strong></td><td><strong>当前版本</strong>：迁移到 OpenInference <code>metadata</code> 命名空间；删 <code>route_type=a2a</code> 加 <code>erp</code> reserved；<code>a2a</code> 仅 <code>engage_mode</code>；Phoenix 17.2.0；host→container route context 传播。见 ADR-0017</td></tr>
+</table>
+
+<hr>
+
+<p style="text-align: center; color: #8b949e; margin-top: 3rem;">
+  MUAP Observability Business Tag Schema v1.3 | 自动生成的约束文档
+</p>
+
+</body>
+</html>

@@ -17,7 +17,7 @@ Known constraints at decision time:
 
 - ADR-0007 locks Phoenix OSS + Grafana as the sanctioned observability stack.
 - ADR-0011 defines the host OpenTelemetry baseline and current session-root behavior.
-- `docs/observability-instrumentation-methodology.md` v1.0 explains how MUAP should instrument Phoenix/OpenInference traces, but it is methodology, not a naming registry.
+- `docs/specs/observability.md` v1.0 explains how MUAP should instrument Phoenix/OpenInference traces, but it is methodology, not a naming registry.
 - Future Phase 0.5 / 1 / 2A / 2B / 3 work will add roughly 85% more span namespaces across mock, agent, provider, MCP, ERP, hardware, GUI, and Python skill surfaces.
 
 Without binding governance before code expands, Phoenix Sessions grouping, query ergonomics, and OpenInference compatibility would drift further with each new feature.
@@ -32,7 +32,7 @@ Without binding governance before code expands, Phoenix Sessions grouping, query
 
 > **拍板**：选 Option C。
 
-Adopt schema v1.0 as defined in `docs/observability-span-schema.md`.
+Adopt schema v1.0 as defined in `docs/specs/observability.md`.
 
 The accepted schema establishes:
 
@@ -51,7 +51,7 @@ The accepted schema establishes:
 
 ## Implementation Notes
 
-- Affected files: `docs/observability-span-schema.md`, `docs/decisions/README.md`, `docs/observability-instrumentation-methodology.md`, `scripts/observability-span-schema.test.ts`
+- Affected files: `docs/specs/observability.md`, `docs/decisions/README.md`, `scripts/observability-span-schema.test.ts`
 - Parent observability baseline: `docs/decisions/ADR-0011-host-otel-instrumentation.md`
 - This ADR records governance and documentation acceptance only; it does not rename runtime spans in `src/**`
 - The contract test in `scripts/observability-span-schema.test.ts` is the enforcement gate for future schema drift
@@ -59,5 +59,4 @@ The accepted schema establishes:
 ## References
 
 - `docs/decisions/ADR-0011-host-otel-instrumentation.md`
-- `docs/observability-instrumentation-methodology.md`
-- `docs/observability-span-schema.md`
+- `docs/specs/observability.md`

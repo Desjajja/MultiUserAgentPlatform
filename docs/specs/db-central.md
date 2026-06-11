@@ -48,7 +48,7 @@ CREATE TABLE messaging_groups (
 
 ### 1.3 `messaging_group_agents`
 
-Wiring: which agent group handles which messaging group. Many-to-many — the same channel can route to multiple agents (see [isolation-model.md](isolation-model.md)).
+Wiring: which agent group handles which messaging group. Many-to-many — the same channel can route to multiple agents (see [isolation-model.md](../isolation-model.md)).
 
 ```sql
 CREATE TABLE messaging_group_agents (
