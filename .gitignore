@@ -48,3 +48,5 @@ container/agent-runner/node_modules/
 # Agent working state (advisory, not authoritative — see CLAUDE.md §Session Continuation Guide)
 .sisyphus/
 
+.omo/
+.github/
