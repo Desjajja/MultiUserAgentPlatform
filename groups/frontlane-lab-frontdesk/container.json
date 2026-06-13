@@ -14,7 +14,7 @@
   },
   "additionalMounts": [],
   "skills": "all",
-  "provider": "sdk-openai",
+  "provider": "litellm-proxy",
   "groupName": "FrontLane Lab Desk",
   "assistantName": "FrontLane Lab Desk",
   "memoryMode": "erp",

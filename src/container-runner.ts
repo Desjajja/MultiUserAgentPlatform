@@ -587,7 +587,13 @@ async function buildContainerArgs(
   // are routed through the agent vault for credential injection. Providers
   // that receive their own direct credentials (openai/codex/sdk-openai)
   // or are fully offline (mock) don't need the gateway to spawn.
-  if (provider === 'openai' || provider === 'codex' || provider === 'mock' || provider === 'sdk-openai') {
+  if (
+    provider === 'openai' ||
+    provider === 'codex' ||
+    provider === 'litellm-proxy' ||
+    provider === 'mock' ||
+    provider === 'sdk-openai'
+  ) {
     log.info('Skipping OneCLI gateway for direct-credential provider', {
       containerName,
       provider,

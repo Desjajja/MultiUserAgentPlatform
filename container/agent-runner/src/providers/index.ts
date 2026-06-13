@@ -3,6 +3,7 @@
 // level. Skills add a new provider by appending one import line below.
 
 import './claude.js';
+import './litellm-proxy.js';
 import './mock.js';
 import './openai.js';
 import './sdk-openai.js';

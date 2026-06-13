@@ -48,6 +48,7 @@ Do not reintroduce old personal-assistant, migration, marketplace, or multi-chan
 - Preserve user/session isolation semantics when changing routing logic.
 - Keep Feishu group-chat behavior conservative; do not widen write permissions based only on group context.
 - When cleaning or extending the repo, prefer deleting unused legacy surface over keeping compatibility shims for old product directions.
+- **Tests use Bun, not vitest.** Run `bun test`; write tests with `import { describe, it, expect } from 'bun:test'`. Do not add vitest imports or run `pnpm test` / `vitest run` for new work. If tests fail unexpectedly, check for incomplete migration (leftover `from 'vitest'`, `vitest.config.ts`, or scripts still pointing at vitest).
 
 ## Useful Docs
 
@@ -70,7 +71,7 @@ This project is intended to support **multi-session, multi-agent collaborative d
 2. **Open `docs/migration-from-v1.md`** to confirm whether V1 closeout context (`../openclaw/CLOSEOUT/`) is reachable.
 3. **Skim `docs/decisions/README.md`** — every ADR is an architectural commitment. If the user's request contradicts an ADR, raise it before implementing.
 4. **Check `.sisyphus/`** if present — it contains prior agent's working state (plans, todos, evidence). Format may be tool-specific; treat as advisory, not authoritative.
-5. **Run `pnpm typecheck && pnpm test`** to confirm the baseline is green before making changes.
+5. **Run `pnpm typecheck && bun test`** to confirm the baseline is green before making changes.
 
 ### When you finish a non-trivial work session, do this:
 

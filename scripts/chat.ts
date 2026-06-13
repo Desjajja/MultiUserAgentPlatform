@@ -3,9 +3,14 @@
  *
  * Usage:
  *   pnpm run chat <message...>
+ *   pnpm run chat --as user-1 --name "User 1" <message...>
  *
  * Sends the message through the CLI channel (Unix socket) to the wired agent.
  * Reads replies until the stream goes quiet, then exits.
+ *
+ * `--as` / `--name` simulate a different sender identity (namespaced as
+ * `cli:<id>` by the permissions module). Use this to test per-user session
+ * isolation without a second platform account.
  *
  * Preconditions: FrontLane host service running, an agent group wired to
  * `cli/local` via `/init-first-agent` or `/manage-channels`.
@@ -22,13 +27,48 @@ function socketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
 }
 
-function main(): void {
-  const words = process.argv.slice(2);
+interface ChatOpts {
+  text: string;
+  senderId?: string;
+  senderName?: string;
+}
+
+function parseArgs(argv: string[]): ChatOpts {
+  let senderId: string | undefined;
+  let senderName: string | undefined;
+  const words: string[] = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--as') {
+      senderId = argv[++i];
+      if (!senderId) {
+        console.error('usage: --as requires a sender id (e.g. user-1)');
+        process.exit(1);
+      }
+      continue;
+    }
+    if (arg === '--name') {
+      senderName = argv[++i];
+      if (!senderName) {
+        console.error('usage: --name requires a display name');
+        process.exit(1);
+      }
+      continue;
+    }
+    words.push(arg);
+  }
+
   if (words.length === 0) {
-    console.error('usage: pnpm run chat <message...>');
+    console.error('usage: pnpm run chat [--as <id>] [--name <display>] <message...>');
     process.exit(1);
   }
-  const text = words.join(' ');
+
+  return { text: words.join(' '), senderId, senderName };
+}
+
+function main(): void {
+  const { text, senderId, senderName } = parseArgs(process.argv.slice(2));
 
   const socket = net.connect(socketPath());
 
@@ -56,7 +96,10 @@ function main(): void {
   }
 
   socket.on('connect', () => {
-    socket.write(JSON.stringify({ text }) + '\n');
+    const payload: Record<string, string> = { text };
+    if (senderId) payload.senderId = senderId;
+    if (senderName) payload.sender = senderName;
+    socket.write(JSON.stringify(payload) + '\n');
     hardTimer = setTimeout(() => {
       if (!firstReplySeen) {
         console.error(`timeout: no reply in ${TOTAL_TIMEOUT_MS}ms`);

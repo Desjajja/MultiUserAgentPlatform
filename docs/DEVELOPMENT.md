@@ -111,15 +111,15 @@ pnpm run dev
 # Typecheck
 pnpm typecheck
 
-# 测试
-pnpm test
-pnpm test path/to/file.test.ts
-pnpm test -t "test name"
+# 测试（统一用 bun test，不用 vitest）
+bun test
+bun test path/to/file.test.ts
+bun test -t "test name"
 ```
 
 ### 2.3 改容器代码
 
-容器代码用 **Bun**，不是 Node。`vitest` 不能用，必须 `bun:test`。
+容器代码用 **Bun**，不是 Node。测试同样用 `bun:test`，不要用 vitest。
 
 ```bash
 # 容器侧 typecheck
@@ -300,21 +300,28 @@ registerDeliveryAction('my_audit', async (msg, ctx) => {
 写测试：
 ```bash
 container/agent-runner/src/mcp-tools/my-tool.test.ts   # bun:test
-src/my-action.test.ts                                  # vitest
+src/my-action.test.ts                                  # bun:test
 ```
 
 ---
 
 ## 6. 测试规约
 
-### 6.1 两套 runtime
+### 6.1 统一用 bun:test
 
 | 位置 | runner | 框架 |
 |---|---|---|
-| `src/*.test.ts` | Node + vitest | `import { describe, it, expect } from 'vitest'` |
-| `container/agent-runner/src/*.test.ts` | Bun + bun:test | `import { ... } from 'bun:test'` |
+| `**/*.test.ts`（host、`scripts/`、container） | Bun | `import { describe, it, expect } from 'bun:test'` |
 
-跨边界跑会失败：vitest 不能 load `bun:sqlite`，bun:test 不认 vitest mocks。
+**不要用 vitest。** 仓库正在从 vitest 迁移到 Bun；`package.json` 里若仍有 `"test": "vitest run"` 或个别文件仍 `from 'vitest'`，属于遗留，应逐步改掉。
+
+**测试报错时先查迁移是否未完成：**
+- 文件仍 `import ... from 'vitest'`
+- 用了 vitest 专有 API（如 `vi` mock 未换成 `bun:test` 的 `mock`）
+- 跑了 `pnpm test` / `vitest run` 而不是 `bun test`
+- `vitest.config.ts` 仍被引用
+
+容器侧额外约束：vitest 不能 load `bun:sqlite`；host 侧 `better-sqlite3` 在 Bun 下通常可跑，但跨边界 mock 习惯不同，别混用两套框架。
 
 ### 6.2 DB 测试
 

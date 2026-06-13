@@ -11,6 +11,8 @@
  *
  *   Client → server:
  *     { "text": "user message" }                          # default — talk to cli/local
+ *     { "text": "...", "senderId": "user-1",
+ *       "sender": "User 1" }                              # simulate another user (pnpm chat --as)
  *     { "text": "...", "to": {"channelType": "discord",
  *                             "platformId": "discord:@me:149...",
  *                             "threadId": null} }         # route to a specific mg
@@ -221,8 +223,7 @@ function createAdapter(): ChannelAdapter {
               timestamp: new Date().toISOString(),
               content: JSON.stringify({
                 text: payload.text,
-                sender: typeof payload.sender === 'string' ? payload.sender : 'cli',
-                senderId: typeof payload.senderId === 'string' ? payload.senderId : `cli:${PLATFORM_ID}`,
+                ...parseCliSender(payload),
               }),
             },
             replyTo: replyTo ?? undefined,
@@ -238,6 +239,7 @@ function createAdapter(): ChannelAdapter {
         // Plain chat — claim the slot (evicting any prior client) and route via
         // the standard onInbound path (adapter injects its own channelType).
         claimChatSlot();
+        const { sender, senderId } = parseCliSender(payload);
         try {
           await config.onInbound(PLATFORM_ID, null, {
             id: `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -245,8 +247,8 @@ function createAdapter(): ChannelAdapter {
             timestamp: new Date().toISOString(),
             content: {
               text: payload.text,
-              sender: 'cli',
-              senderId: `cli:${PLATFORM_ID}`,
+              sender,
+              senderId,
             },
           });
         } catch (err) {
@@ -254,6 +256,19 @@ function createAdapter(): ChannelAdapter {
         }
       }),
     );
+  }
+
+  function parseCliSender(payload: { sender?: unknown; senderId?: unknown }): {
+    sender: string;
+    senderId: string;
+  } {
+    const senderId =
+      typeof payload.senderId === 'string' && payload.senderId.length > 0
+        ? payload.senderId
+        : `cli:${PLATFORM_ID}`;
+    const sender =
+      typeof payload.sender === 'string' && payload.sender.length > 0 ? payload.sender : 'cli';
+    return { sender, senderId };
   }
 
   function parseAddress(raw: unknown): DeliveryAddress | null {
