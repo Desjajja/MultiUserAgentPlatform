@@ -53,3 +53,5 @@ infra/litellm/config.yaml
 
 .omo/
 .github/
+
+.cursor/
